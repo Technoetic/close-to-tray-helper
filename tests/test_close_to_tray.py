@@ -1,10 +1,11 @@
-"""Unit tests for close-to-tray.ps1 and close-to-tray-launch.vbs (Windows only).
+"""Unit tests for close-to-tray.ps1, close-to-tray-launch.vbs, and installer scripts (Windows only).
 
 The self-test shows three small top-most test windows for a moment and installs a
 temporary global mouse hook, so it runs only when CLOSE_TO_TRAY_SELFTEST=1 is set.
 """
 from __future__ import annotations
 
+import ctypes
 import json
 import os
 import pathlib
@@ -16,6 +17,10 @@ import unittest
 SCRIPTS_DIR = pathlib.Path(__file__).resolve().parents[1]
 TRAY_PS1 = SCRIPTS_DIR / "close-to-tray.ps1"
 LAUNCHER_VBS = SCRIPTS_DIR / "close-to-tray-launch.vbs"
+INSTALL_PS1 = SCRIPTS_DIR / "install.ps1"
+INSTALL_CMD = SCRIPTS_DIR / "install.cmd"
+UNINSTALL_PS1 = SCRIPTS_DIR / "uninstall.ps1"
+UNINSTALL_CMD = SCRIPTS_DIR / "uninstall.cmd"
 PS_EXE = str(pathlib.Path(os.environ.get("SystemRoot", r"C:\Windows")) / "System32" / "WindowsPowerShell" / "v1.0" / "powershell.exe")
 RUN_SELFTEST = os.environ.get("CLOSE_TO_TRAY_SELFTEST") == "1"
 
@@ -34,7 +39,7 @@ def _run_ps(args: list[str], timeout: int = 30) -> subprocess.CompletedProcess[s
 @unittest.skipUnless(sys.platform == "win32", "Windows only")
 class TestCloseToTray(unittest.TestCase):
     def test_files_exist_and_are_pure_ascii(self) -> None:
-        for path in (TRAY_PS1, LAUNCHER_VBS):
+        for path in (TRAY_PS1, LAUNCHER_VBS, INSTALL_PS1, INSTALL_CMD, UNINSTALL_PS1, UNINSTALL_CMD):
             self.assertTrue(path.is_file(), f"Missing {path}")
             raw = path.read_bytes()
             self.assertFalse(raw.startswith(b"\xef\xbb\xbf"), f"Unexpected BOM in {path.name}")
@@ -49,15 +54,28 @@ class TestCloseToTray(unittest.TestCase):
         self.assertIn("shell.Run cmd, 0, False", text)
 
     def test_powershell_syntax_valid(self) -> None:
-        cmd = (
-            "$t=$null; $e=$null; "
-            f"[void][System.Management.Automation.Language.Parser]::ParseFile('{TRAY_PS1}', [ref]$t, [ref]$e); "
-            "if ($e.Count -gt 0) { $e | ForEach-Object { Write-Error $_.Message }; exit 1 } "
-            "Write-Output 'PARSE_OK'"
-        )
-        proc = _run_ps(["-Command", cmd])
-        self.assertEqual(proc.returncode, 0, proc.stderr)
-        self.assertIn("PARSE_OK", proc.stdout)
+        for script in (TRAY_PS1, INSTALL_PS1, UNINSTALL_PS1):
+            with self.subTest(script=script.name):
+                cmd = (
+                    "$t=$null; $e=$null; "
+                    f"[void][System.Management.Automation.Language.Parser]::ParseFile('{script}', [ref]$t, [ref]$e); "
+                    "if ($e.Count -gt 0) { $e | ForEach-Object { Write-Error $_.Message }; exit 1 } "
+                    "Write-Output 'PARSE_OK'"
+                )
+                proc = _run_ps(["-Command", cmd])
+                self.assertEqual(proc.returncode, 0, proc.stderr)
+                self.assertIn("PARSE_OK", proc.stdout)
+
+    def test_ipc_reports_not_running_when_no_listener_exists(self) -> None:
+        hwnd = ctypes.windll.user32.FindWindowW(None, "CloseToTrayHelperIpcListener")
+        if hwnd:
+            self.skipTest("A live CloseToTrayHelperIpcListener window is active on this desktop")
+        proc = _run_ps(["-File", str(TRAY_PS1), "-Show", "-Json"])
+        self.assertEqual(proc.returncode, 0, proc.stderr or proc.stdout)
+        data = json.loads(proc.stdout.strip())
+        self.assertEqual(data["action"], "show")
+        self.assertFalse(data["running"])
+        self.assertFalse(data["sent"])
 
     @unittest.skipUnless(RUN_SELFTEST, "set CLOSE_TO_TRAY_SELFTEST=1 to run the desktop self-test")
     def test_self_test_close_intercept_and_prefs_roundtrip(self) -> None:
@@ -79,6 +97,7 @@ class TestCloseToTray(unittest.TestCase):
             self.assertTrue(data1["launcher_found"])
             self.assertIn("aside_up_found", data1)
             self.assertTrue(data1["ipc_msg_registered"])
+            self.assertGreaterEqual(data1["tooltip_max_len"], 27)
             self.assertLessEqual(data1["tooltip_max_len"], 63)
             self.assertEqual(data1["apartment_state"], "STA")
             self.assertTrue(prefs.is_file())
@@ -130,6 +149,7 @@ class TestCloseToTray(unittest.TestCase):
             self.assertEqual(inst.returncode, 0, inst.stderr or inst.stdout)
             inst_data = json.loads(inst.stdout.strip())
             self.assertTrue(inst_data["ok"])
+            self.assertEqual(inst_data["icon_exe"], "")
             lnk = pathlib.Path(inst_data["shortcut"])
             self.assertTrue(lnk.is_file())
             self.assertEqual(lnk.name, "Close To Tray Helper.lnk")
@@ -137,12 +157,13 @@ class TestCloseToTray(unittest.TestCase):
             verify_cmd = (
                 "$w = New-Object -ComObject WScript.Shell; "
                 f"$s = $w.CreateShortcut('{lnk}'); "
-                "Write-Output ($s.TargetPath + '|' + $s.Arguments)"
+                "Write-Output ($s.TargetPath + '|' + $s.Arguments + '|' + $s.IconLocation)"
             )
             chk = _run_ps(["-Command", verify_cmd])
             self.assertEqual(chk.returncode, 0, chk.stderr)
             self.assertIn("wscript.exe", chk.stdout.lower())
             self.assertIn("close-to-tray-launch.vbs", chk.stdout.lower())
+            self.assertTrue(chk.stdout.strip().endswith("|,0"), chk.stdout)
 
             uninst = _run_ps([
                 "-File", str(TRAY_PS1),
