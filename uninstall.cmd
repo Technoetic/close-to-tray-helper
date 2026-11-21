@@ -1,5 +1,6 @@
 @echo off
 setlocal DisableDelayedExpansion
+set "PSModulePath="
 set "_ps=%~dp0uninstall.ps1"
 set "_leave="
 if /i "%CD%\"=="%~dp0" set "_leave=1"

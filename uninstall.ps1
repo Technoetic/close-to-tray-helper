@@ -43,7 +43,17 @@ function Get-CheckedAttributes([string] $Path, [switch] $Directory, [string] $St
 
 function Get-Digest([string] $Path, [string] $StopAt = '') {
     if ($null -ne (Get-CheckedAttributes -Path $Path -StopAt $StopAt)) {
-        return (Get-FileHash -Algorithm SHA256 -LiteralPath $Path).Hash
+        $sha = [Security.Cryptography.SHA256]::Create()
+        try {
+            $fs = [IO.File]::OpenRead($Path)
+            try {
+                return [BitConverter]::ToString($sha.ComputeHash($fs)).Replace('-', '')
+            } finally {
+                $fs.Dispose()
+            }
+        } finally {
+            $sha.Dispose()
+        }
     }
 }
 
@@ -190,10 +200,12 @@ try {
     }
 
     $startupTarget = if ($StartupDir) { Get-FullPath $StartupDir } else { [Environment]::GetFolderPath('Startup') }
-    $shortcut = Join-Path $startupTarget 'Close To Tray Helper.lnk'
-    if (Test-Path -LiteralPath $shortcut -PathType Leaf) {
-        Remove-Item -LiteralPath $shortcut -Force
-        Write-Host "Removed Startup shortcut: $shortcut"
+    if ($startupTarget) {
+        $shortcut = Join-Path $startupTarget 'Close To Tray Helper.lnk'
+        if (Test-Path -LiteralPath $shortcut -PathType Leaf) {
+            Remove-Item -LiteralPath $shortcut -Force
+            Write-Host "Removed Startup shortcut: $shortcut"
+        }
     }
 
     foreach ($plan in $plans) {
