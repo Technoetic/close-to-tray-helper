@@ -45,7 +45,17 @@ function Get-CheckedAttributes([string] $Path, [switch] $Directory, [string] $St
 
 function Get-Digest([string] $Path, [string] $StopAt = '') {
     if ($null -ne (Get-CheckedAttributes -Path $Path -StopAt $StopAt)) {
-        return (Get-FileHash -Algorithm SHA256 -LiteralPath $Path).Hash
+        $sha = [Security.Cryptography.SHA256]::Create()
+        try {
+            $fs = [IO.File]::OpenRead($Path)
+            try {
+                return [BitConverter]::ToString($sha.ComputeHash($fs)).Replace('-', '')
+            } finally {
+                $fs.Dispose()
+            }
+        } finally {
+            $sha.Dispose()
+        }
     }
 }
 
