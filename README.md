@@ -8,8 +8,8 @@ Status: v0.1.0, first public release (2026-11-21). The known issues below are pl
 
 ## Why
 
-- The supported browser has no built-in "minimize to tray" or "close to tray" option (checked on version 1.0.1116.2).
-- Closing its last window also ends its background daemon, which stops its command-line automation until the browser is started again.
+- We found no "minimize to tray" or "close to tray" option in the browser's official documentation or changelog (checked 2026-11-21), and on our test PC (browser version 1.0.1116.2) the browser never showed a tray icon of its own.
+- On that PC, closing the browser's last window also ended its background daemon, which stopped its command-line automation until the browser was started again.
 - This helper keeps the browser alive but out of the way.
 
 ## Features
@@ -21,11 +21,11 @@ Status: v0.1.0, first public release (2026-11-21). The known issues below are pl
 - **Tray icon**: a left click opens or hides the browser. The right-click menu is listed below.
 - **Clean exit**: on exit, `-Stop` or Windows sign-out, the mouse hook is removed and every hidden browser window is put back on the taskbar. The helper never closes or kills the browser.
 - **Single instance** through the named mutex `Local\Close-To-Tray-Helper`.
-- **Settings** are saved in `%LOCALAPPDATA%\CloseToTrayHelper\prefs.json` (hide mode, close to tray, auto-start).
+- **Settings** are saved in `%LOCALAPPDATA%\CloseToTrayHelper\prefs.json`: the hide mode, close to tray, and whether to start the browser when the helper starts. Start-up at Windows sign-in is not stored there; it is the Startup shortcut itself.
 
 ## What it does and does not do
 
-- It watches left mouse clicks system-wide only to tell whether the click hit the close button of the last browser window. It does not record or send input.
+- It watches left mouse clicks system-wide only to tell whether the click hit the close button of the last browser window. It does not record or send input. The one click that hits that close button (and its button-up) is swallowed, so the window is hidden instead of closed.
 - It has no keyboard hook and makes no network connections.
 - It does not inject code into the browser or change the browser's files. It only minimizes, hides and restores the browser's own top-level windows and removes or restores their taskbar buttons.
 - Windows sign-in start-up is opt-in (`-InstallStartup`).
@@ -33,7 +33,7 @@ Status: v0.1.0, first public release (2026-11-21). The known issues below are pl
 ## Requirements
 
 - Windows 10 or 11 with the built-in **64-bit** Windows PowerShell 5.1, .NET Framework 4.x and Windows Script Host. A 32-bit PowerShell cannot inspect the 64-bit browser process.
-- The supported browser installed. Its executable is found in this order: `-AsideExe`, the `ASIDE_EXE` environment variable, then the default install folders under `%ProgramFiles%`, `%ProgramFiles(x86)%` and `%LOCALAPPDATA%`.
+- The supported browser installed. If `-AsideExe` or the `ASIDE_EXE` environment variable is given, that path is used as is, with no fallback. Otherwise the helper looks in the default install folders under `%ProgramFiles%`, `%ProgramFiles(x86)%` and `%LOCALAPPDATA%`.
 - Tested with browser version 1.0.1116.2 on Windows 11.
 
 ## Run
@@ -88,6 +88,8 @@ The menu labels are in Korean.
 | `-PrefsPath <file>`, `-StartupDir <dir>` | Use another settings file or Startup folder |
 | `-SelfTest` | Run the offline self-test |
 | `-Json` | Print results as JSON |
+
+Switches that change settings (`-Mode`, `-CloseToTray`, `-NoCloseToTray`) apply when the helper starts. If a helper is already running, a second start exits without changing anything, so use the tray menu or run `-Stop` first. If neither a launcher script nor the browser executable can be found, "start the browser" does nothing.
 
 ## Uninstall
 
