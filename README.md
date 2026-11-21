@@ -2,13 +2,14 @@
 
 A small Windows helper that keeps a browser running in the system tray. Minimized browser windows leave the taskbar and sit behind a tray icon, and clicking × on the last browser window hides it instead of quitting.
 
-It currently supports the Aside AI browser. This is an unofficial project: it is not affiliated with, endorsed by or supported by the makers of that browser, and it contains none of their logos or other branding.
+It currently supports the Aside AI browser. This is an unofficial project: it is not affiliated with, endorsed by or supported by the makers of that browser, and it uses none of their logos or other branding. The tray icon is a standard Windows icon.
 
-Status: v0.1.0, first public release (2026-11-21). The known issues below are planned for later versions.
+Status: v0.1.1 (2026-11-21). The known issues below are planned for later versions. See the changelog at the end.
 
 ## Why
 
-- We found no "minimize to tray" or "close to tray" option in the browser's official documentation or changelog (checked 2026-11-21), and on our test PC (browser version 1.0.1116.2) the browser never showed a tray icon of its own.
+- The browser's official documentation describes no "minimize to tray" or "close to tray" option (checked 2026-11-21). Its changelog mentions "tray menus on Windows" and a "keep-tasks-running" preference without explaining them, so a tray menu that appears only in some situations cannot be ruled out.
+- On our test PC (browser version 1.0.1116.2), Windows has no record of the browser registering a tray icon of its own.
 - On that PC, closing the browser's last window also ended its background daemon, which stopped its command-line automation until the browser was started again.
 - This helper keeps the browser alive but out of the way.
 
@@ -118,6 +119,11 @@ Windows only. The default run checks the files, the PowerShell syntax and the St
 ```powershell
 $env:CLOSE_TO_TRAY_SELFTEST = '1'; python -m unittest discover -s tests -v
 ```
+
+## Changelog
+
+- **v0.1.1** (2026-11-21): the tray icon and the Startup shortcut use standard Windows icons instead of the browser's own icon. Console output starts with `[close-to-tray]`. The README states exactly what was checked about the browser's own tray options.
+- **v0.1.0** (2026-11-21): first public release.
 
 ## License
 

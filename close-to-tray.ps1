@@ -174,7 +174,7 @@ $ResolvedAsideExe = Find-AsideBrowserExe $AsideExe
 
 # Handle startup install/uninstall actions without launching the tray loop.
 if ($InstallStartup) {
-    $lnk = Install-StartupShortcut -Dir $StartupDir -VbsPath $LauncherVbs -IconExe $ResolvedAsideExe
+    $lnk = Install-StartupShortcut -Dir $StartupDir -VbsPath $LauncherVbs -IconExe ''
     $res = [ordered]@{
         action = 'install-startup'
         ok = (Test-Path -LiteralPath $lnk -PathType Leaf)
@@ -182,7 +182,7 @@ if ($InstallStartup) {
         launcher = $LauncherVbs
         icon_exe = $ResolvedAsideExe
     }
-    Out-Result $res ("[aside-tray] startup shortcut installed: $lnk")
+    Out-Result $res ("[close-to-tray] startup shortcut installed: $lnk")
     exit 0
 }
 
@@ -194,7 +194,7 @@ if ($UninstallStartup) {
         shortcut = $info.path
         removed = $info.removed
     }
-    Out-Result $res ("[aside-tray] startup shortcut removed=$($info.removed): $($info.path)")
+    Out-Result $res ("[close-to-tray] startup shortcut removed=$($info.removed): $($info.path)")
     exit 0
 }
 
@@ -1135,18 +1135,7 @@ namespace CloseToTrayHelper
 
         private Icon LoadTrayIcon()
         {
-            try
-            {
-                if (!string.IsNullOrEmpty(_asideExe) && File.Exists(_asideExe))
-                {
-                    _ownedIcon = Icon.ExtractAssociatedIcon(_asideExe);
-                    if (_ownedIcon != null) return _ownedIcon;
-                }
-            }
-            catch
-            {
-                // Fallback to default icon.
-            }
+            // Neutral Windows icon: the helper does not reuse the browser's own icon or logo.
             return SystemIcons.Application;
         }
 
@@ -1605,10 +1594,7 @@ namespace CloseToTrayHelper
                         scType.InvokeMember("Arguments", System.Reflection.BindingFlags.SetProperty, null, sc, new object[] { string.Format("//B //Nologo \"{0}\"", _launcherVbs) });
                         scType.InvokeMember("WorkingDirectory", System.Reflection.BindingFlags.SetProperty, null, sc, new object[] { Path.GetDirectoryName(_launcherVbs) });
                         scType.InvokeMember("Description", System.Reflection.BindingFlags.SetProperty, null, sc, new object[] { "Close-to-tray helper (unofficial)" });
-                        if (!string.IsNullOrEmpty(_asideExe) && File.Exists(_asideExe))
-                        {
-                            scType.InvokeMember("IconLocation", System.Reflection.BindingFlags.SetProperty, null, sc, new object[] { _asideExe + ",0" });
-                        }
+                        // No IconLocation: the shortcut keeps the default wscript.exe icon (no browser logo).
                         scType.InvokeMember("Save", System.Reflection.BindingFlags.InvokeMethod, null, sc, null);
                         Marshal.ReleaseComObject(sc);
                     }
@@ -1975,14 +1961,8 @@ namespace CloseToTrayHelper
         public static string RunSelfTest(string asideExe)
         {
             NativeMethods.TryEnablePerMonitorDpi();
-            bool iconOk = false;
-            if (!string.IsNullOrEmpty(asideExe) && File.Exists(asideExe))
-            {
-                using (var ico = Icon.ExtractAssociatedIcon(asideExe))
-                {
-                    iconOk = (ico != null && ico.Width > 0);
-                }
-            }
+            Icon neutralIcon = SystemIcons.Application;
+            bool iconOk = (neutralIcon != null && neutralIcon.Width > 0);
             bool shellTrayPresent = NativeMethods.FindWindow("Shell_TrayWnd", null) != IntPtr.Zero;
             bool tbReady;
             using (var tb = new TaskbarBridge())
@@ -2017,7 +1997,7 @@ if ($Stop -or $Show -or $Hide -or $Toggle) {
     elseif ($Toggle) { $cmd = [CloseToTrayHelper.TrayIpcCommand]::Toggle; $name = 'toggle' }
     $sent = [CloseToTrayHelper.AsideIpc]::SendCommand($cmd)
     $res = [ordered]@{ action = $name; sent = $sent }
-    Out-Result $res ("[aside-tray] command=$name sent=$sent")
+    Out-Result $res ("[close-to-tray] command=$name sent=$sent")
     exit 0
 }
 
@@ -2083,7 +2063,7 @@ if ($SelfTest) {
             disabled_passed = ($kv['disabled_passed'] -eq 'True')
         }
     }
-    Out-Result $res ("[aside-tray] self-test ok=$ok mode=$($prefs.mode) close_to_tray=$($prefs.closeToTray) close_ok=$closeOk")
+    Out-Result $res ("[close-to-tray] self-test ok=$ok mode=$($prefs.mode) close_to_tray=$($prefs.closeToTray) close_ok=$closeOk")
     if ($ok) { exit 0 } else { exit 1 }
 }
 
