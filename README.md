@@ -7,34 +7,41 @@
 
 **Aside에서 명령줄 자동화를 돌리는 동안 브라우저 창을 치우고 싶을 때 쓰는 Windows 도우미입니다.** 마지막 창의 `×`를 마우스 왼쪽으로 누르면 작업 표시줄에서 창이 사라지고 브라우저는 계속 실행됩니다. 다시 보고 싶을 때는 시계 옆 트레이 아이콘을 한 번 클릭하세요.
 
-[릴리스 소스 받기](https://github.com/Technoetic/close-to-tray-helper/releases/tag/v0.1.1) · [동작을 그림으로 보기](docs/VISUAL-GUIDE.md) · [실행 스크립트 읽기](close-to-tray.ps1)
+[최신 릴리스 받기](https://github.com/Technoetic/close-to-tray-helper/releases/latest) · [동작을 그림으로 보기](docs/VISUAL-GUIDE.md) · [실행 스크립트 읽기](close-to-tray.ps1)
 
-## 바로 실행하기
+## 도우미와 스킬 함께 설치하기
 
 **준비물**은 Windows 10 또는 11, 설치된 Aside AI 브라우저, Windows 기본 64비트 PowerShell 5.1, .NET Framework 4.x, Windows Script Host입니다. 32비트 PowerShell로는 64비트 브라우저 프로세스를 확인할 수 없습니다.
 
-```powershell
-git clone https://github.com/Technoetic/close-to-tray-helper
-cd close-to-tray-helper
-wscript .\close-to-tray-launch.vbs
+1. [최신 릴리스](https://github.com/Technoetic/close-to-tray-helper/releases/latest)에서 **Source code (zip)**을 받아 폴더 전체를 압축 해제합니다.
+2. 폴더의 **`install.cmd`**를 두 번 클릭합니다. 도우미와 `aside-repl`이 현재 Windows 사용자 계정에 함께 설치됩니다. Git으로 복제했다면 저장소 폴더에서 `.\install.cmd`를 실행해도 됩니다.
+3. 도우미를 시작하려면 `Win+R`을 누르고 아래 경로를 입력합니다. Windows 11에서는 시계 옆 **숨겨진 아이콘 표시(∧)**에서 트레이 아이콘을 찾을 수 있습니다.
+
+```text
+%LOCALAPPDATA%\CloseToTrayHelper\app\close-to-tray-launch.vbs
 ```
 
-마지막 줄이 콘솔 창 없이 도우미를 시작합니다. Git을 쓰지 않는다면 릴리스의 **Source code (zip)**을 풀고 `close-to-tray-launch.vbs`를 실행해도 됩니다. Windows 11에서는 시계 옆 **숨겨진 아이콘 표시(∧)** 안에 트레이 아이콘이 생길 수 있습니다. 도우미는 Windows 기본 응용 프로그램 아이콘을 사용합니다.
+새 릴리스로 업데이트할 때도 같은 설치 파일을 실행하세요. 직접 설치한 동명 스킬이나 수정한 설치 파일이 있으면 설치기가 충돌 경로를 표시합니다. 해당 파일을 따로 보관한 뒤 재시도할 수 있습니다.
 
 > **처음 써보기** — Aside 창 하나를 열고 오른쪽 위 `×`를 클릭한 뒤, 트레이 아이콘을 왼쪽 클릭해 보세요. 같은 창이 돌아옵니다. 브라우저를 실제로 끝내려면 마지막 창에서 `Alt+F4`를 누르세요.
 
 ## 트레이에 둔 브라우저로 README 제목 읽기
 
-브라우저를 트레이에 둔 채 공개 페이지를 읽어 보세요. 저장소에는 Codex용 [`$aside-repl` 스킬](.agents/skills/aside-repl/SKILL.md)이 함께 들어 있습니다. 위 `git clone` 명령이나 [스킬이 포함된 main ZIP](https://github.com/Technoetic/close-to-tray-helper/archive/refs/heads/main.zip)으로 받으세요. 이 예제에는 실행 중인 Aside, PATH에 등록된 `aside` CLI, Python 3가 필요합니다.
+Antigravity(agy), Claude Code, Codex는 같은 [스킬과 실행 예제](.agents/skills/aside-repl/SKILL.md)를 사용합니다. 설치한 뒤 원하는 프로젝트에서 새 대화를 열고, 아래 호출 뒤에 **“https://github.com/Technoetic/close-to-tray-helper 에서 README의 첫 제목을 읽어 줘.”**라고 적어 보세요.
 
-**Codex에서** 저장소 폴더를 열고 다음과 같이 요청하세요.
+| 도구 | 호출 | 사용자별 기본 스킬 폴더 |
+|---|---|---|
+| Antigravity (agy) | `/aside-repl` | `%USERPROFILE%\.gemini\config\skills\aside-repl` |
+| Claude Code | `/aside-repl` | `%USERPROFILE%\.claude\skills\aside-repl` |
+| Codex | `$aside-repl` | `%USERPROFILE%\.agents\skills\aside-repl` |
 
-> `$aside-repl 이 저장소의 공개 GitHub 페이지를 열고 README의 첫 제목을 알려 줘.`
+`CLAUDE_CONFIG_DIR` 또는 `CODEX_HOME`을 지정한 계정에서는 해당 설정 폴더 아래의 `skills\aside-repl`에 설치합니다. [Antigravity 스킬](https://antigravity.google/docs/customization-discovery?tab=cli) · [Claude Code 스킬](https://code.claude.com/docs/en/skills) · [Codex 스킬](https://learn.chatgpt.com/docs/build-skills)
 
-**PowerShell에서 직접** 실행하려면 저장소 루트에서 아래 명령을 사용하세요.
+**PowerShell에서 직접** 실행할 때는 설치된 스킬 폴더 중 하나를 사용하세요. 이 예제에는 실행 중인 Aside, PATH에 등록된 `aside` CLI, Python 3가 필요합니다.
 
 ```powershell
-python .agents/skills/aside-repl/scripts/run_repl.py .agents/skills/aside-repl/examples/readme-title.js
+$skill = Join-Path $env:USERPROFILE '.gemini\config\skills\aside-repl'
+python "$skill\scripts\run_repl.py" "$skill\examples\readme-title.js"
 ```
 
 실행기가 알려 주는 `stdout.txt`를 열면 `{"heading":"Close to Tray Helper"}`를 확인할 수 있습니다. 예제는 자신이 연 탭만 닫습니다. [예제 코드 보기](.agents/skills/aside-repl/examples/readme-title.js)
@@ -86,10 +93,11 @@ PowerShell에서 직접 실행할 때는 `-STA`를 붙입니다. 로그인할 �
 
 ```powershell
 # 현재 세션에서 직접 실행
-powershell -NoProfile -ExecutionPolicy Bypass -STA -File .\close-to-tray.ps1
+$helper = Join-Path $env:LOCALAPPDATA 'CloseToTrayHelper\app\close-to-tray.ps1'
+powershell -NoProfile -ExecutionPolicy Bypass -STA -File "$helper"
 
 # 선택 사항: Windows 로그인 시 자동 실행
-powershell -NoProfile -ExecutionPolicy Bypass -File .\close-to-tray.ps1 -InstallStartup
+powershell -NoProfile -ExecutionPolicy Bypass -File "$helper" -InstallStartup
 ```
 
 숨김 방식, 닫기 버튼 처리, 브라우저 동시 시작 여부는 `%LOCALAPPDATA%\CloseToTrayHelper\prefs.json`에 저장됩니다. **Windows 로그인 시 자동 실행**은 시작프로그램 폴더의 `Close To Tray Helper.lnk`로 관리합니다. 도우미 폴더를 옮겼다면 `-InstallStartup`을 다시 실행하세요.
@@ -153,16 +161,21 @@ $env:CLOSE_TO_TRAY_SELFTEST = '1'
 python -m unittest discover -s tests -v
 ```
 
-**제거**하려면 아래 두 명령을 실행한 다음 `%LOCALAPPDATA%\CloseToTrayHelper`와 내려받은 도우미 폴더를 삭제하세요. 첫 번째 명령이 숨긴 창을 먼저 복원합니다.
+**제거**할 때는 먼저 숨긴 창을 복원하고 로그인 바로 가기를 해제합니다.
 
 ```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -File .\close-to-tray.ps1 -Stop
-powershell -NoProfile -ExecutionPolicy Bypass -File .\close-to-tray.ps1 -UninstallStartup
+$helper = Join-Path $env:LOCALAPPDATA 'CloseToTrayHelper\app\close-to-tray.ps1'
+powershell -NoProfile -ExecutionPolicy Bypass -File "$helper" -Stop
+powershell -NoProfile -ExecutionPolicy Bypass -File "$helper" -UninstallStartup
 ```
+
+도우미와 설정까지 지우려면 `%LOCALAPPDATA%\CloseToTrayHelper`에서 보관할 파일을 옮긴 후 해당 폴더를 삭제하세요. 스킬도 제거하려면 설치가 끝날 때 표시된 각 `aside-repl` 폴더에서 `.close-to-tray-bundle.json`의 파일 목록을 확인하고, 목록의 파일과 이 JSON 파일을 삭제하세요.
 
 </details>
 
 ## 변경 이력과 라이선스
+
+- [v0.2.0 · 2026-11-21](https://github.com/Technoetic/close-to-tray-helper/releases/tag/v0.2.0) — Windows 설치 한 번으로 트레이 도우미와 Antigravity·Claude Code·Codex용 `aside-repl`을 함께 설치합니다.
 
 - [v0.1.1 · 2026-11-21](https://github.com/Technoetic/close-to-tray-helper/releases/tag/v0.1.1) — 트레이와 바로 가기에 Windows 표준 아이콘을 사용합니다. 콘솔 출력은 `[close-to-tray]`로 시작합니다. 브라우저 자체 트레이 기능에 관해 확인한 범위를 문서화했습니다.
 - [v0.1.0 · 2026-11-21](https://github.com/Technoetic/close-to-tray-helper/releases/tag/v0.1.0) — 첫 공개 버전입니다.
