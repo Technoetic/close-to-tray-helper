@@ -23,6 +23,22 @@ wscript .\close-to-tray-launch.vbs
 
 > **처음 써보기** — Aside 창 하나를 열고 오른쪽 위 `×`를 클릭한 뒤, 트레이 아이콘을 왼쪽 클릭해 보세요. 같은 창이 돌아옵니다. 브라우저를 실제로 끝내려면 마지막 창에서 `Alt+F4`를 누르세요.
 
+## 트레이에 둔 브라우저로 README 제목 읽기
+
+브라우저를 트레이에 둔 채 공개 페이지를 읽어 보세요. 저장소에는 Codex용 [`$aside-repl` 스킬](.agents/skills/aside-repl/SKILL.md)이 함께 들어 있습니다. 위 `git clone` 명령이나 [스킬이 포함된 main ZIP](https://github.com/Technoetic/close-to-tray-helper/archive/refs/heads/main.zip)으로 받으세요. 이 예제에는 실행 중인 Aside, PATH에 등록된 `aside` CLI, Python 3가 필요합니다.
+
+**Codex에서** 저장소 폴더를 열고 다음과 같이 요청하세요.
+
+> `$aside-repl 이 저장소의 공개 GitHub 페이지를 열고 README의 첫 제목을 알려 줘.`
+
+**PowerShell에서 직접** 실행하려면 저장소 루트에서 아래 명령을 사용하세요.
+
+```powershell
+python .agents/skills/aside-repl/scripts/run_repl.py .agents/skills/aside-repl/examples/readme-title.js
+```
+
+실행기가 알려 주는 `stdout.txt`를 열면 `{"heading":"Close to Tray Helper"}`를 확인할 수 있습니다. 예제는 자신이 연 탭만 닫습니다. [예제 코드 보기](.agents/skills/aside-repl/examples/readme-title.js)
+
 ## 어느 클릭이 트레이로 갈까?
 
 ```mermaid
