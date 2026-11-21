@@ -9,6 +9,9 @@ import subprocess
 import sys
 import tempfile
 
+DEFAULT_TIMEOUT_SECONDS = 120
+WINDOWS_MAX_CODE_CHARS = 30000
+
 
 def describe(path):
     digest = hashlib.sha256()
@@ -18,16 +21,29 @@ def describe(path):
     return {"path": str(path), "bytes": path.stat().st_size, "sha256": digest.hexdigest()}
 
 
-def main():
+def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("script", type=Path, help="UTF-8 JavaScript file")
-    args = parser.parse_args()
+    parser.add_argument(
+        "--timeout",
+        type=float,
+        default=DEFAULT_TIMEOUT_SECONDS,
+        help=f"Maximum execution time in seconds (default: {DEFAULT_TIMEOUT_SECONDS})",
+    )
+    args = parser.parse_args(argv)
+    if args.timeout <= 0:
+        parser.exit(2, "Timeout must be greater than zero.\n")
     try:
         code = args.script.read_text(encoding="utf-8-sig")
     except (OSError, UnicodeError) as error:
         parser.exit(2, f"Cannot read script: {error}\n")
     if not code.strip():
         parser.exit(2, "The JavaScript file is empty.\n")
+    if sys.platform == "win32" and len(code) > WINDOWS_MAX_CODE_CHARS:
+        parser.exit(
+            2,
+            f"Script exceeds Windows command-line safety limit ({len(code)} > {WINDOWS_MAX_CODE_CHARS} chars).\n",
+        )
     executable = shutil.which("aside")
     if executable is None:
         parser.exit(127, "Aside CLI was not found on PATH.\n")
@@ -35,17 +51,35 @@ def main():
     directory = Path(tempfile.mkdtemp(prefix="aside-repl-"))
     stdout = directory / "stdout.txt"
     stderr = directory / "stderr.txt"
+    timed_out = False
     with stdout.open("wb") as out, stderr.open("wb") as err:
         try:
             result = subprocess.run(
-                [executable, "repl", code], stdin=subprocess.DEVNULL, stdout=out, stderr=err
+                [executable, "repl", code],
+                stdin=subprocess.DEVNULL,
+                stdout=out,
+                stderr=err,
+                timeout=args.timeout,
             )
             exit_code = result.returncode
+        except subprocess.TimeoutExpired:
+            err.write(f"Aside REPL timed out after {args.timeout:g}s.\n".encode("utf-8"))
+            timed_out = True
+            exit_code = 124
         except OSError as error:
             err.write(f"Cannot launch Aside CLI: {error}\n".encode("utf-8"))
             exit_code = 1
 
-    print(json.dumps({"exit_code": exit_code, "stdout": describe(stdout), "stderr": describe(stderr)}))
+    print(
+        json.dumps(
+            {
+                "exit_code": exit_code,
+                "timed_out": timed_out,
+                "stdout": describe(stdout),
+                "stderr": describe(stderr),
+            }
+        )
+    )
     return exit_code
 
 

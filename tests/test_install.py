@@ -1,4 +1,6 @@
-"""Exercise the Windows bundle installer in disposable user and package directories."""
+"""Exercise the Windows bundle installer and uninstaller in disposable directories."""
+import hashlib
+import json
 import os
 from pathlib import Path
 import shutil
@@ -10,7 +12,7 @@ import unittest
 
 REPO = Path(__file__).resolve().parents[1]
 SKILL_SOURCE = Path(".agents/skills/aside-repl")
-APP_FILES = ("close-to-tray.ps1", "close-to-tray-launch.vbs", "LICENSE")
+APP_FILES = ("close-to-tray.ps1", "close-to-tray-launch.vbs", "uninstall.ps1", "uninstall.cmd", "LICENSE")
 SKILL_FILES = ("SKILL.md", "scripts/run_repl.py", "examples/readme-title.js")
 
 
@@ -25,6 +27,8 @@ class TestBundleInstall(unittest.TestCase):
         self.profile.mkdir()
         self.local = self.profile / "AppData/Local"
         self.app = self.local / "CloseToTrayHelper/app"
+        self.startup = self.root / "startup [1]"
+        self.startup.mkdir()
         self.env = os.environ.copy()
         self.env.update(
             CI="1",
@@ -50,10 +54,10 @@ class TestBundleInstall(unittest.TestCase):
             dest.parent.mkdir(parents=True, exist_ok=True)
             shutil.copyfile(REPO / rel, dest)
 
-    def install(self, *args, error_file=None):
+    def _run_cmd(self, batch_path: Path, *args, error_file=None, cwd=None) -> subprocess.CompletedProcess[str]:
         proc = subprocess.run(
-            [self.env["COMSPEC"], "/d", "/c", "call", str(self.package / "install.cmd"), *map(str, args)],
-            cwd=self.root,
+            [self.env["COMSPEC"], "/d", "/c", "call", str(batch_path), *map(str, args)],
+            cwd=cwd or self.root,
             env=self.env,
             stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE,
@@ -67,6 +71,13 @@ class TestBundleInstall(unittest.TestCase):
         else:
             self.assertNotEqual(proc.returncode, 0, proc.stdout)
             self.assertIn(error_file, proc.stdout)
+        return proc
+
+    def install(self, *args, error_file=None, cwd=None):
+        return self._run_cmd(self.package / "install.cmd", *args, error_file=error_file, cwd=cwd)
+
+    def uninstall(self, *args, batch_path=None, error_file=None, cwd=None):
+        return self._run_cmd(batch_path or (self.package / "uninstall.cmd"), *args, error_file=error_file, cwd=cwd)
 
     def assert_payloads(self, app, skills):
         for name in APP_FILES:
@@ -83,12 +94,27 @@ class TestBundleInstall(unittest.TestCase):
         return {
             f.relative_to(self.profile): f.read_bytes()
             for dest in [self.app, *self.skills]
+            if dest.exists()
             for f in dest.rglob("*")
             if f.is_file()
         }
 
-    def test_default_cmd_installs_all_hosts_and_updates_managed_files(self):
+    def test_clean_profile_does_not_create_unused_agent_dirs(self):
+        proc = self.install()
+        self.assert_payloads(self.app, [])
+        for agent_dir in (".agents", ".claude", ".gemini"):
+            self.assertFalse((self.profile / agent_dir).exists(), agent_dir)
+        self.assertIn("-AllHosts", proc.stdout)
+
+    def test_detected_single_agent_installs_only_that_agent(self):
+        (self.profile / ".claude").mkdir()
         self.install()
+        self.assert_payloads(self.app, [self.skills[1]])
+        self.assertFalse((self.profile / ".agents").exists())
+        self.assertFalse((self.profile / ".gemini").exists())
+
+    def test_all_hosts_installs_and_updates_managed_files(self):
+        self.install("-AllHosts")
         self.assert_payloads(self.app, self.skills)
         extra = self.skills[1] / "my-notes.txt"
         extra.write_bytes(b"keep my file")
@@ -101,9 +127,17 @@ class TestBundleInstall(unittest.TestCase):
         self.assert_payloads(self.app, self.skills)
         self.assertEqual(extra.read_bytes(), b"keep my file")
 
+    def test_app_only_skips_skills_even_when_foreign_skill_exists(self):
+        self.skills[1].mkdir(parents=True)
+        (self.skills[1] / "SKILL.md").write_bytes(b"user-owned skill")
+        self.install("-AppOnly")
+        self.assert_payloads(self.app, [])
+        self.assertEqual((self.skills[1] / "SKILL.md").read_bytes(), b"user-owned skill")
+
     def test_custom_agent_homes(self):
         self.env["CODEX_HOME"] = str(self.profile / "custom codex")
         self.env["CLAUDE_CONFIG_DIR"] = str(self.profile / "custom claude")
+        (self.profile / ".gemini").mkdir()
         self.install()
         self.assert_payloads(self.app, [
             self.profile / "custom codex/skills/aside-repl",
@@ -121,6 +155,73 @@ class TestBundleInstall(unittest.TestCase):
         for default in [self.app, *self.skills]:
             self.assertFalse(default.exists(), default)
 
+    def test_ancestor_junction_on_dot_claude_succeeds_while_target_junction_blocks(self):
+        real_claude = self.root / "dotfiles_claude"
+        real_claude.mkdir()
+        junc_claude = self.profile / ".claude"
+        mk = subprocess.run(["cmd", "/c", "mklink", "/J", str(junc_claude), str(real_claude)], capture_output=True, text=True)
+        self.assertEqual(mk.returncode, 0, mk.stderr)
+        # Installing into a symlinked/junctioned .claude dotfiles folder should work cleanly.
+        self.install()
+        self.assert_payloads(self.app, [self.skills[1]])
+        # Uninstall through the junctioned .claude folder should also succeed cleanly.
+        self.uninstall("-StartupDir", self.startup)
+        self.assertFalse(self.app.exists())
+        self.assertFalse(self.skills[1].exists())
+        self.assertTrue(real_claude.exists())
+
+        # A junction directly at the managed target (aside-repl itself) MUST still be blocked.
+        escape_dir = self.root / "escape_target"
+        escape_dir.mkdir()
+        (junc_claude / "skills").mkdir(parents=True, exist_ok=True)
+        mk2 = subprocess.run(["cmd", "/c", "mklink", "/J", str(self.skills[1]), str(escape_dir)], capture_output=True, text=True)
+        self.assertEqual(mk2.returncode, 0, mk2.stderr)
+        self.install(error_file="Linked path requires manual review")
+
+    def test_v020_manifest_upgrades_cleanly_to_v021(self):
+        # Simulate an existing v0.2.0 installation whose app manifest only tracked 3 files.
+        self.app.mkdir(parents=True)
+        v020_files = ("close-to-tray.ps1", "close-to-tray-launch.vbs", "LICENSE")
+        manifest_files = {}
+        for name in v020_files:
+            dest = self.app / name
+            shutil.copyfile(self.package / name, dest)
+            manifest_files[name] = [hashlib.sha256(dest.read_bytes()).hexdigest().upper()]
+        manifest = {"format": "close-to-tray-helper/app/1", "files": manifest_files}
+        (self.app / ".close-to-tray-bundle.json").write_text(json.dumps(manifest), encoding="utf-8")
+
+        self.install("-AppOnly")
+        self.assert_payloads(self.app, [])
+        self.assertTrue((self.app / "uninstall.cmd").is_file())
+        self.assertTrue((self.app / "uninstall.ps1").is_file())
+
+    def test_uninstall_self_deletes_preserves_user_files_and_guards_edits(self):
+        self.install("-AllHosts")
+        prefs = self.app.parent / "prefs.json"
+        prefs.write_text('{"mode":"DeleteTab"}', encoding="utf-8")
+        shortcut = self.startup / "Close To Tray Helper.lnk"
+        shortcut.write_bytes(b"stub-lnk")
+        extra = self.skills[1] / "my-notes.txt"
+        extra.write_bytes(b"keep my file")
+
+        # Locally edited file blocks uninstall unless -Force is passed.
+        (self.skills[0] / "SKILL.md").write_bytes(b"local user tweak")
+        self.uninstall("-StartupDir", self.startup, error_file="SKILL.md")
+        self.assertTrue(self.app.exists())
+        self.assertTrue(shortcut.exists())
+
+        # Running the installed app/uninstall.cmd FROM cwd=self.app (as Explorer double-click does)
+        # with -Force cleans everything cleanly while keeping extra user files.
+        self.uninstall("-StartupDir", self.startup, "-Force", batch_path=self.app / "uninstall.cmd", cwd=self.app)
+        self.assertFalse(self.app.exists())
+        self.assertFalse(self.app.parent.exists())
+        self.assertFalse(prefs.exists())
+        self.assertFalse(shortcut.exists())
+        self.assertFalse((self.skills[0] / "SKILL.md").exists())
+        self.assertEqual(extra.read_bytes(), b"keep my file")
+        self.assertFalse((self.skills[1] / "SKILL.md").exists())
+        self.assertFalse((self.skills[2]).exists())
+
     def test_foreign_skill_blocks_install_before_any_other_host_is_changed(self):
         self.skills[-1].mkdir(parents=True)
         upstream = (self.package / SKILL_SOURCE / "SKILL.md").read_bytes()
@@ -128,22 +229,22 @@ class TestBundleInstall(unittest.TestCase):
             with self.subTest(identical_to_release=content == upstream):
                 (self.skills[-1] / "SKILL.md").write_bytes(content)
                 before = self.installed_files()
-                self.install(error_file="SKILL.md")
+                self.install("-AllHosts", error_file="SKILL.md")
                 self.assertEqual(self.installed_files(), before)
 
     def test_modified_managed_file_blocks_entire_upgrade(self):
-        self.install()
+        self.install("-AllHosts")
         (self.skills[-1] / "scripts/run_repl.py").write_bytes(b"local edit")
         (self.package / "LICENSE").write_bytes(b"release update")
         with (self.package / SKILL_SOURCE / "SKILL.md").open("ab") as f:
             f.write(b"\r\nNew release note.\r\n")
         before = self.installed_files()
-        self.install(error_file="run_repl.py")
+        self.install("-AllHosts", error_file="run_repl.py")
         self.assertEqual(self.installed_files(), before)
 
     def test_incomplete_release_installs_no_files(self):
         (self.package / SKILL_SOURCE / "examples/readme-title.js").unlink()
-        self.install(error_file="readme-title.js")
+        self.install("-AllHosts", error_file="readme-title.js")
         self.assertEqual(self.installed_files(), {})
 
 

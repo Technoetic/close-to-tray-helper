@@ -24,7 +24,7 @@ description: Aside 브라우저에서 페이지를 확인하거나 요청받은 
 python scripts/run_repl.py examples/readme-title.js
 ```
 
-실행기는 Python 3 표준 라이브러리로 JavaScript 전체를 셸 해석 없이 `aside repl`에 인수 하나로 전달한다. 매번 새 임시 폴더에 `stdout.txt`, `stderr.txt`를 만들고 경로·크기·SHA-256과 CLI 종료 코드를 알려 준다. 공개 예제에서는 `stdout.txt`의 JSON 결과를 확인한다. CLI 상태 메시지도 함께 들어갈 수 있다. 종료 코드와 기대한 결과를 함께 확인한다.
+실행기는 Python 3 표준 라이브러리로 JavaScript 전체를 셸 해석 없이 `aside repl`에 인수 하나로 전달한다(기본 제한 시간 `--timeout 120`초, 초과 시 종료 코드 `124` · `timed_out: true` 반환; Windows 명령행 길이 상한 30,000자 초과 시 실행 전 차단). 매번 새 임시 폴더에 `stdout.txt`, `stderr.txt`를 만들고 경로·크기·SHA-256과 CLI 종료 코드를 알려 준다. 공개 예제에서는 `stdout.txt`의 JSON 결과를 확인한다. CLI 상태 메시지도 함께 들어갈 수 있다. 종료 코드와 기대한 결과를 함께 확인한다.
 
 Python이 없는 Git Bash 환경에서는 다음처럼 실행한다. `task.js`는 직접 검토한 스크립트다.
 

@@ -180,7 +180,8 @@ if ($InstallStartup) {
         ok = (Test-Path -LiteralPath $lnk -PathType Leaf)
         shortcut = $lnk
         launcher = $LauncherVbs
-        icon_exe = $ResolvedAsideExe
+        icon_exe = ''
+        aside_exe = $ResolvedAsideExe
     }
     Out-Result $res ("[close-to-tray] startup shortcut installed: $lnk")
     exit 0
@@ -953,14 +954,27 @@ namespace CloseToTrayHelper
     public static class AsideIpc
     {
         public const string MutexName = @"Local\Close-To-Tray-Helper";
+        public const string ListenerWindowCaption = "CloseToTrayHelperIpcListener";
         public const string IpcMessageName = "CloseToTrayHelper_Command_v1";
         public const string InternalHideMessageName = "CloseToTrayHelper_InternalHide_v1";
 
+        public static IntPtr FindListenerWindow()
+        {
+            return NativeMethods.FindWindow(null, ListenerWindowCaption);
+        }
+
+        public static bool IsHelperRunning()
+        {
+            return FindListenerWindow() != IntPtr.Zero;
+        }
+
         public static bool SendCommand(TrayIpcCommand cmd)
         {
+            IntPtr target = FindListenerWindow();
+            if (target == IntPtr.Zero) return false;
             uint msg = NativeMethods.RegisterWindowMessage(IpcMessageName);
             if (msg == 0) return false;
-            return NativeMethods.PostMessage(NativeMethods.HWND_BROADCAST, msg, new IntPtr((int)cmd), IntPtr.Zero);
+            return NativeMethods.PostMessage(target, msg, new IntPtr((int)cmd), IntPtr.Zero);
         }
     }
 
@@ -1006,7 +1020,7 @@ namespace CloseToTrayHelper
         private ToolStripMenuItem _miStartup;
         private ToolStripMenuItem _miAutoStart;
         private ToolStripMenuItem _miExit;
-        private Icon _ownedIcon;
+        private Font _showBoldFont;
         private System.Windows.Forms.Timer _timer;
         private BroadcastListenerWindow _listener;
         private CloseButtonInterceptor _closeInterceptor;
@@ -1085,7 +1099,8 @@ namespace CloseToTrayHelper
             _menu.Opening += (s, e) => RefreshMenuState();
 
             _miShow = new ToolStripMenuItem(MENU_SHOW);
-            _miShow.Font = new Font(_miShow.Font, FontStyle.Bold);
+            _showBoldFont = new Font(_miShow.Font, FontStyle.Bold);
+            _miShow.Font = _showBoldFont;
             _miShow.Click += (s, e) => ShowAllAsideWindows();
 
             _miHide = new ToolStripMenuItem(MENU_HIDE);
@@ -1699,15 +1714,15 @@ namespace CloseToTrayHelper
                 try { _tray.Visible = false; _tray.Dispose(); } catch { }
                 _tray = null;
             }
-            if (_ownedIcon != null)
-            {
-                try { _ownedIcon.Dispose(); } catch { }
-                _ownedIcon = null;
-            }
             if (_menu != null)
             {
                 try { _menu.Dispose(); } catch { }
                 _menu = null;
+            }
+            if (_showBoldFont != null)
+            {
+                try { _showBoldFont.Dispose(); } catch { }
+                _showBoldFont = null;
             }
             if (_listener != null)
             {
@@ -1971,10 +1986,11 @@ namespace CloseToTrayHelper
                 tbReady = tb.EnsureReady(out changed);
             }
             uint ipcMsg = NativeMethods.RegisterWindowMessage(AsideIpc.IpcMessageName);
+            int maxTipLen = Math.Max(TIP_HIDDEN.Length, Math.Max(TIP_VISIBLE.Length, TIP_STOPPED.Length));
             string closeDiag = RunCloseInterceptTest();
             return string.Format(
                 "icon_ok={0};shell_tray={1};taskbar_ready={2};ipc_msg={3};tip_len={4};{5}",
-                iconOk, shellTrayPresent, tbReady, ipcMsg > 0, TIP_VISIBLE.Length, closeDiag);
+                iconOk, shellTrayPresent, tbReady, ipcMsg > 0, maxTipLen, closeDiag);
         }
     }
 }
@@ -1995,9 +2011,10 @@ if ($Stop -or $Show -or $Hide -or $Toggle) {
     elseif ($Show) { $cmd = [CloseToTrayHelper.TrayIpcCommand]::Show; $name = 'show' }
     elseif ($Hide) { $cmd = [CloseToTrayHelper.TrayIpcCommand]::Hide; $name = 'hide' }
     elseif ($Toggle) { $cmd = [CloseToTrayHelper.TrayIpcCommand]::Toggle; $name = 'toggle' }
+    $running = [CloseToTrayHelper.AsideIpc]::IsHelperRunning()
     $sent = [CloseToTrayHelper.AsideIpc]::SendCommand($cmd)
-    $res = [ordered]@{ action = $name; sent = $sent }
-    Out-Result $res ("[close-to-tray] command=$name sent=$sent")
+    $res = [ordered]@{ action = $name; running = $running; sent = $sent }
+    Out-Result $res ("[close-to-tray] command=$name running=$running sent=$sent")
     exit 0
 }
 
