@@ -15,7 +15,7 @@
 
 **Requirements:** Windows 10 or 11 (64-bit), installed Aside browser, built-in 64-bit Windows PowerShell 5.1, .NET Framework 4.x, and Windows Script Host. (32-bit PowerShell cannot inspect 64-bit browser processes.)
 
-1. Download **`close-to-tray-helper-0.3.0-windows.zip`** (slim package, ~60 KB — excludes repo docs/visuals) and optional **`SHA256SUMS.txt`** from [Latest Release](https://github.com/Technoetic/close-to-tray-helper/releases/latest), then extract the ZIP.
+1. Download **`close-to-tray-helper-0.3.0-windows.zip`** (slim package, ~68 KB — excludes repo docs/visuals) and optional **`SHA256SUMS.txt`** from [Latest Release](https://github.com/Technoetic/close-to-tray-helper/releases/latest), then extract the ZIP.
 2. Double-click **`install.cmd`** (or run `.\install.cmd` in PowerShell):
    - Installs the tray helper and uninstaller to `%LOCALAPPDATA%\CloseToTrayHelper\app`.
    - Automatically installs the `aside-repl` skill **only** for detected AI coding agents (Antigravity, Claude Code, Codex) — never creates folders for agents you do not use.
