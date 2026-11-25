@@ -15,7 +15,7 @@
 
 **준비물**은 Windows 10 또는 11(64비트), 설치된 Aside AI 브라우저, Windows 기본 64비트 PowerShell 5.1, .NET Framework 4.x, Windows Script Host입니다. 32비트 PowerShell로는 64비트 브라우저 프로세스를 확인할 수 없습니다.
 
-1. [최신 릴리스](https://github.com/Technoetic/close-to-tray-helper/releases/latest)에서 슬림 배포본 **`close-to-tray-helper-0.3.0-windows.zip`**(약 60 KB, 도감 이미지 제외)과 필요 시 **`SHA256SUMS.txt`**를 받아 압축을 풉니다.
+1. [최신 릴리스](https://github.com/Technoetic/close-to-tray-helper/releases/latest)에서 슬림 배포본 **`close-to-tray-helper-0.3.0-windows.zip`**(약 68 KB, 도감 이미지 제외)과 필요 시 **`SHA256SUMS.txt`**를 받아 압축을 풉니다.
 2. 폴더의 **`install.cmd`**를 두 번 클릭합니다(Git 복제본에서는 `.\install.cmd`).
    - 도우미와 제거기(`uninstall.cmd`)가 `%LOCALAPPDATA%\CloseToTrayHelper\app`에 설치됩니다.
    - `aside-repl` 스킬은 이 PC에 **설정 폴더가 존재하는 AI 도구**(Antigravity · Claude Code · Codex)에만 자동 설치되며, 쓰지 않는 도구 폴더는 만들지 않습니다.
