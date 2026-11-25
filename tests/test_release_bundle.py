@@ -17,6 +17,26 @@ INVISIBLE_RE = re.compile(r"[\u00ad\u034f\u061c\u200b-\u200f\u202a-\u202e\u2060-
 TEXT_SUFFIXES = {".ps1", ".vbs", ".cmd", ".py", ".js", ".md", ".yml", ".yaml", ".txt", ".json"}
 
 
+def _live_helper_running() -> bool:
+    """A Close to Tray Helper runs in this session (its listener window or its session-wide mutex exists).
+
+    The installer and uninstaller stop a running helper through that mutex and window, which a temporary profile
+    does not isolate, so tests that run them must not run next to a live helper."""
+    if sys.platform != "win32":
+        return False
+    import ctypes
+    if ctypes.windll.user32.FindWindowW(None, "CloseToTrayHelperIpcListener"):
+        return True
+    handle = ctypes.windll.kernel32.OpenMutexW(0x00100000, False, "Local\\Close-To-Tray-Helper")
+    if handle:
+        ctypes.windll.kernel32.CloseHandle(handle)
+        return True
+    return False
+
+
+LIVE_HELPER = _live_helper_running()
+
+
 class TestReleaseBundleAndHygiene(unittest.TestCase):
     def test_repo_text_files_have_no_bom_or_invisible_unicode(self):
         for p in sorted(REPO.rglob("*")):
@@ -61,6 +81,9 @@ class TestReleaseBundleAndHygiene(unittest.TestCase):
                 self.assertIn("close-to-tray-helper-0.2.1/.agents/skills/aside-repl/SKILL.md", names)
 
             if sys.platform == "win32":
+                if LIVE_HELPER:
+                    self.skipTest("ZIP checks passed; the install round trip is skipped because a live Close to Tray "
+                                  "Helper runs here and the uninstaller would stop it")
                 extract_dir = Path(td) / "extracted"
                 with zipfile.ZipFile(z1, "r") as zf:
                     zf.extractall(extract_dir)

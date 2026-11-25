@@ -192,11 +192,23 @@ try {
     $stopPs1 = if (Test-Path -LiteralPath $helperPs1 -PathType Leaf) { $helperPs1 } elseif (Test-Path -LiteralPath $fallbackPs1 -PathType Leaf) { $fallbackPs1 } else { '' }
     if ($stopPs1 -and (Test-HelperRunning)) {
         & $psExe -NoProfile -ExecutionPolicy Bypass -File $stopPs1 -Stop | Out-Null
-        $deadline = (Get-Date).AddSeconds(5)
+        # A helper in the middle of a memory restart stops only after the browser is open again (about two
+        # minutes at most); otherwise it stops within a second.
+        $deadline = (Get-Date).AddSeconds(130)
+        $quietUntil = (Get-Date).AddSeconds(2)
+        $announced = $false
         while ((Test-HelperRunning) -and (Get-Date) -lt $deadline) {
+            if (-not $announced -and (Get-Date) -gt $quietUntil) {
+                Write-Host 'Waiting for Close to Tray Helper to exit (up to 130 s while it finishes a browser restart)...'
+                $announced = $true
+            }
             Start-Sleep -Milliseconds 150
         }
-        Write-Host 'Stopped running Close to Tray Helper and restored hidden windows.'
+        if (Test-HelperRunning) {
+            Write-Host 'Warning: Close to Tray Helper did not exit within 130 s; it keeps running until it finishes and then exits. Its files are removed now.'
+        } else {
+            Write-Host 'Stopped running Close to Tray Helper and restored hidden windows.'
+        }
     }
 
     $startupTarget = if ($StartupDir) { Get-FullPath $StartupDir } else { [Environment]::GetFolderPath('Startup') }
