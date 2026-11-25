@@ -16,6 +16,26 @@ APP_FILES = ("close-to-tray.ps1", "close-to-tray-launch.vbs", "uninstall.ps1", "
 SKILL_FILES = ("SKILL.md", "scripts/run_repl.py", "examples/readme-title.js")
 
 
+def _live_helper_running() -> bool:
+    """A Close to Tray Helper runs in this session (its listener window or its session-wide mutex exists).
+
+    The installer and uninstaller stop a running helper through that mutex and window, which a temporary profile
+    does not isolate, so tests that run them must not run next to a live helper."""
+    if sys.platform != "win32":
+        return False
+    import ctypes
+    if ctypes.windll.user32.FindWindowW(None, "CloseToTrayHelperIpcListener"):
+        return True
+    handle = ctypes.windll.kernel32.OpenMutexW(0x00100000, False, "Local\\Close-To-Tray-Helper")
+    if handle:
+        ctypes.windll.kernel32.CloseHandle(handle)
+        return True
+    return False
+
+
+LIVE_HELPER = _live_helper_running()
+
+
 @unittest.skipUnless(sys.platform == "win32", "Windows bundle installer")
 class TestBundleInstall(unittest.TestCase):
     def setUp(self):
@@ -155,6 +175,7 @@ class TestBundleInstall(unittest.TestCase):
         for default in [self.app, *self.skills]:
             self.assertFalse(default.exists(), default)
 
+    @unittest.skipIf(LIVE_HELPER, "a live Close to Tray Helper runs here; the uninstaller would stop it")
     def test_ancestor_junction_on_dot_claude_succeeds_while_target_junction_blocks(self):
         real_claude = self.root / "dotfiles_claude"
         real_claude.mkdir()
@@ -195,6 +216,7 @@ class TestBundleInstall(unittest.TestCase):
         self.assertTrue((self.app / "uninstall.cmd").is_file())
         self.assertTrue((self.app / "uninstall.ps1").is_file())
 
+    @unittest.skipIf(LIVE_HELPER, "a live Close to Tray Helper runs here; the uninstaller would stop it")
     def test_uninstall_self_deletes_preserves_user_files_and_guards_edits(self):
         self.install("-AllHosts")
         prefs = self.app.parent / "prefs.json"

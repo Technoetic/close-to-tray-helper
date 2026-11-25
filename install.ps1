@@ -241,23 +241,36 @@ try {
     $wasRunning = Test-HelperRunning
     $psExe = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
     $installedPs1 = Join-Path $app 'close-to-tray.ps1'
+    $stillRunning = $false
     if ($wasRunning -and $Restart.IsPresent) {
         $stopScript = if (Test-Path -LiteralPath $installedPs1 -PathType Leaf) { $installedPs1 } else { Join-Path $PSScriptRoot 'close-to-tray.ps1' }
         & $psExe -NoProfile -ExecutionPolicy Bypass -File $stopScript -Stop | Out-Null
-        $deadline = (Get-Date).AddSeconds(5)
+        # A helper in the middle of a memory restart stops only after the browser is open again (about two
+        # minutes at most); otherwise it stops within a second.
+        $deadline = (Get-Date).AddSeconds(130)
+        $quietUntil = (Get-Date).AddSeconds(2)
+        $announced = $false
         while ((Test-HelperRunning) -and (Get-Date) -lt $deadline) {
+            if (-not $announced -and (Get-Date) -gt $quietUntil) {
+                Write-Host 'Waiting for Close to Tray Helper to exit (up to 130 s while it finishes a browser restart)...'
+                $announced = $true
+            }
             Start-Sleep -Milliseconds 150
         }
+        $stillRunning = Test-HelperRunning
     }
 
     foreach ($plan in $plans) { Install-Plan $plan }
 
-    if ($wasRunning -and $Restart.IsPresent) {
+    if ($wasRunning -and $Restart.IsPresent -and $stillRunning) {
+        # A new instance would exit at once while the old one still holds the single-instance lock.
+        Write-Host 'Warning: Close to Tray Helper did not exit within 130 s, so it was not started again. The updated files are installed; start the helper after the old one has exited.'
+    } elseif ($wasRunning -and $Restart.IsPresent) {
         $vbs = Join-Path $app 'close-to-tray-launch.vbs'
         Start-Process -FilePath (Join-Path $env:SystemRoot 'System32\wscript.exe') -ArgumentList ('//B //Nologo "{0}"' -f $vbs)
         Write-Host 'Restarted Close to Tray Helper with the updated files.'
     } elseif ($wasRunning) {
-        Write-Host 'Notice: Close to Tray Helper is currently running; restart it (-Stop then relaunch, or run install.ps1 -Restart) to load the updated files.'
+        Write-Host 'Notice: Close to Tray Helper is currently running; restart it to load the updated files (-Stop, wait until it has exited, then relaunch; or run install.ps1 -Restart).'
     }
 
     if ($skillTargets.Count -gt 0) {

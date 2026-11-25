@@ -19,8 +19,25 @@
       Extra windows (when 2+ Aside windows exist) close normally; Alt+F4 or
       unchecking the tray menu toggle closes Aside normally.
     - Zero-orphan guarantee: on exit, -Stop, or Windows session ending, the mouse
-      hook is unhooked and every hidden Aside window is restored to the taskbar
-      (never closes or kills Aside).
+      hook is unhooked and every hidden Aside window is restored to the taskbar.
+      The helper never kills Aside; the only time it closes Aside's windows is
+      the memory restart below.
+    - Memory restart (default ON, toggleable in tray menu): some Aside builds
+      (for example 1.0.1116.2) keep shared memory in the main process that is
+      released only when Aside exits; it counts toward system commit but not
+      toward any process's private bytes. Every 60 s the helper reads the
+      largest shared commit of a browser process. When it reaches restartAtGB
+      (default 4), or the uptime reaches restartAfterHours (default 0 = off),
+      it restarts the browser only if the browser has exactly one window
+      (hidden ones count) and that window is in the tray, no Aside CLI process
+      has run for 15 minutes, nothing is full-screen, the browser has no active
+      audio session, and there has been no keyboard or mouse input for
+      restartIdleMinutes (default 10). A restart posts WM_CLOSE (never a forced
+      kill), waits 60 s (60 s more for a slow exit, up to 30 min for a page
+      prompt), starts the same executable with --restore-last-session, and puts
+      the window back in the tray. It pauses 1 h after a restart and 6 h after
+      a failure. The tray menu shows the measured memory and offers an
+      immediate restart (-RestartBrowser does the same).
     - Single-instance via Local\Close-To-Tray-Helper mutex.
     - Start Aside (tray menu, -StartAside, auto-start): runs an optional launcher
       script (-AsideUpScript, default aside-up.ps1 next to this file) if present,
@@ -45,7 +62,10 @@ param(
     [switch]$Hide,
     [switch]$Toggle,
     [switch]$StartAside,
+    [switch]$Restart,
+    [switch]$RestartBrowser,
     [switch]$SelfTest,
+    [switch]$PolicyTest,
     [switch]$Json
 )
 
@@ -122,17 +142,38 @@ function Uninstall-StartupShortcut([string]$Dir) {
     return @{ path = $lnkPath; removed = $removed }
 }
 
+function ConvertTo-PrefNumber($Value, [double]$Min, [double]$Max, [double]$Default, [bool]$AllowZero) {
+    # A JSON number (or a numeric string) inside [Min, Max], or 0 when AllowZero; anything else gives Default.
+    if ($null -eq $Value -or $Value -is [bool]) { return $Default }
+    $n = 0.0
+    if ($Value -is [string]) {
+        if (-not [double]::TryParse($Value, [System.Globalization.NumberStyles]::Float, [System.Globalization.CultureInfo]::InvariantCulture, [ref]$n)) { return $Default }
+    } elseif ($Value -is [int] -or $Value -is [long] -or $Value -is [double] -or $Value -is [decimal] -or $Value -is [single]) {
+        $n = [double]$Value
+    } else {
+        return $Default
+    }
+    if ([double]::IsNaN($n) -or [double]::IsInfinity($n)) { return $Default }
+    if ($AllowZero -and $n -eq 0) { return 0.0 }
+    if ($n -lt $Min -or $n -gt $Max) { return $Default }
+    return $n
+}
+
 function Read-TrayPrefs([string]$Path) {
     $prefs = [ordered]@{
         mode = 'DeleteTab'
         autoStartAside = $false
         closeToTray = $true
+        autoRestart = $true
+        restartAtGB = 4.0
+        restartAfterHours = 0.0
+        restartIdleMinutes = 10
     }
     if ($Path -and (Test-Path -LiteralPath $Path -PathType Leaf)) {
         try {
             $raw = Get-Content -LiteralPath $Path -Raw -Encoding UTF8
             $obj = $raw | ConvertFrom-Json
-            if ($obj -and ($obj.mode -eq 'DeleteTab' -or $obj.mode -eq 'HideWindow')) {
+            if ($obj -and ($obj.PSObject.Properties.Name -contains 'mode') -and ($obj.mode -eq 'DeleteTab' -or $obj.mode -eq 'HideWindow')) {
                 $prefs.mode = [string]$obj.mode
             }
             if ($obj -and ($obj.PSObject.Properties.Name -contains 'autoStartAside') -and $null -ne $obj.autoStartAside) {
@@ -141,6 +182,18 @@ function Read-TrayPrefs([string]$Path) {
             if ($obj -and ($obj.PSObject.Properties.Name -contains 'closeToTray') -and $null -ne $obj.closeToTray) {
                 $prefs.closeToTray = [bool]$obj.closeToTray
             }
+            if ($obj -and ($obj.PSObject.Properties.Name -contains 'autoRestart') -and $obj.autoRestart -is [bool]) {
+                $prefs.autoRestart = [bool]$obj.autoRestart
+            }
+            if ($obj -and ($obj.PSObject.Properties.Name -contains 'restartAtGB')) {
+                $prefs.restartAtGB = ConvertTo-PrefNumber $obj.restartAtGB 0.5 1024 4.0 $true
+            }
+            if ($obj -and ($obj.PSObject.Properties.Name -contains 'restartAfterHours')) {
+                $prefs.restartAfterHours = ConvertTo-PrefNumber $obj.restartAfterHours 1 720 0.0 $true
+            }
+            if ($obj -and ($obj.PSObject.Properties.Name -contains 'restartIdleMinutes')) {
+                $prefs.restartIdleMinutes = [int](ConvertTo-PrefNumber $obj.restartIdleMinutes 1 1440 10 $false)
+            }
         } catch {
             # Ignore malformed prefs and keep safe defaults.
         }
@@ -148,15 +201,19 @@ function Read-TrayPrefs([string]$Path) {
     return $prefs
 }
 
-function Write-TrayPrefs([string]$Path, [string]$ModeVal, [bool]$AutoStartVal, [bool]$CloseToTrayVal) {
+function Write-TrayPrefs([string]$Path, $Prefs) {
     $dir = Split-Path -Parent $Path
     if ($dir -and -not (Test-Path -LiteralPath $dir -PathType Container)) {
         [void](New-Item -ItemType Directory -Path $dir -Force)
     }
     $payload = ([ordered]@{
-        mode = $ModeVal
-        autoStartAside = $AutoStartVal
-        closeToTray = $CloseToTrayVal
+        mode = [string]$Prefs.mode
+        autoStartAside = [bool]$Prefs.autoStartAside
+        closeToTray = [bool]$Prefs.closeToTray
+        autoRestart = [bool]$Prefs.autoRestart
+        restartAtGB = [double]$Prefs.restartAtGB
+        restartAfterHours = [double]$Prefs.restartAfterHours
+        restartIdleMinutes = [int]$Prefs.restartIdleMinutes
     } | ConvertTo-Json -Compress)
     $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
     [System.IO.File]::WriteAllText($Path, $payload, $utf8NoBom)
@@ -228,7 +285,8 @@ namespace CloseToTrayHelper
         Stop = 1,
         Show = 2,
         Hide = 3,
-        Toggle = 4
+        Toggle = 4,
+        RestartBrowser = 5
     }
 
     [ComImport]
@@ -285,6 +343,34 @@ namespace CloseToTrayHelper
         public IntPtr dwExtraInfo;
     }
 
+    [StructLayout(LayoutKind.Sequential)]
+    public struct LASTINPUTINFO
+    {
+        public uint cbSize;
+        public uint dwTime;
+    }
+
+    // PROCESS_MEMORY_COUNTERS_EX2 (psapi.h). SharedCommitUsage is the commit of shared sections the process
+    // references. Documented for Windows 10 and 11 22H2 with the September 2023 update and later. An older build
+    // accepts this size but fills only the part it knows and writes that size back into cb (MemoryProbe checks).
+    [StructLayout(LayoutKind.Sequential)]
+    public struct PROCESS_MEMORY_COUNTERS_EX2
+    {
+        public uint cb;
+        public uint PageFaultCount;
+        public UIntPtr PeakWorkingSetSize;
+        public UIntPtr WorkingSetSize;
+        public UIntPtr QuotaPeakPagedPoolUsage;
+        public UIntPtr QuotaPagedPoolUsage;
+        public UIntPtr QuotaPeakNonPagedPoolUsage;
+        public UIntPtr QuotaNonPagedPoolUsage;
+        public UIntPtr PagefileUsage;
+        public UIntPtr PeakPagefileUsage;
+        public UIntPtr PrivateUsage;
+        public UIntPtr PrivateWorkingSetSize;
+        public ulong SharedCommitUsage;
+    }
+
     public static class NativeMethods
     {
         public delegate bool EnumWindowsProc(IntPtr hwnd, IntPtr lParam);
@@ -325,6 +411,9 @@ namespace CloseToTrayHelper
 
         [DllImport("user32.dll")]
         public static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint processId);
+
+        [DllImport("user32.dll")]
+        public static extern IntPtr GetForegroundWindow();
 
         [DllImport("user32.dll")]
         public static extern bool IsWindow(IntPtr hWnd);
@@ -393,6 +482,105 @@ namespace CloseToTrayHelper
 
         [DllImport("kernel32.dll", CharSet = CharSet.Unicode)]
         public static extern IntPtr GetModuleHandle(string lpModuleName);
+
+        public const uint WM_CLOSE = 0x0010;
+        public const uint PROCESS_QUERY_LIMITED_INFORMATION = 0x1000;
+
+        [DllImport("user32.dll")]
+        public static extern bool GetLastInputInfo(ref LASTINPUTINFO plii);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        public static extern IntPtr OpenProcess(uint dwDesiredAccess, bool bInheritHandle, int dwProcessId);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        public static extern bool CloseHandle(IntPtr hObject);
+
+        [DllImport("kernel32.dll", SetLastError = true, EntryPoint = "K32GetProcessMemoryInfo")]
+        public static extern bool GetProcessMemoryInfoEx2(IntPtr process, ref PROCESS_MEMORY_COUNTERS_EX2 counters, uint cb);
+
+        public const uint SYNCHRONIZE = 0x00100000;
+        public const uint WAIT_OBJECT_0 = 0;
+
+        [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+        public static extern bool QueryFullProcessImageName(IntPtr hProcess, uint dwFlags, StringBuilder lpExeName, ref uint lpdwSize);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        public static extern uint WaitForSingleObject(IntPtr hHandle, uint dwMilliseconds);
+
+        [DllImport("shell32.dll")]
+        public static extern int SHQueryUserNotificationState(out int pquns);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        public static extern bool GetProcessTimes(IntPtr hProcess, out long creation, out long exit, out long kernel, out long user);
+
+        // Start time (UTC) of a process, read with PROCESS_QUERY_LIMITED_INFORMATION only; MinValue when unknown.
+        public static DateTime ProcessStartUtc(int pid)
+        {
+            IntPtr h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid);
+            if (h == IntPtr.Zero) return DateTime.MinValue;
+            try
+            {
+                long creation, exit, kernel, user;
+                if (!GetProcessTimes(h, out creation, out exit, out kernel, out user)) return DateTime.MinValue;
+                return DateTime.FromFileTimeUtc(creation);
+            }
+            catch
+            {
+                return DateTime.MinValue;
+            }
+            finally
+            {
+                CloseHandle(h);
+            }
+        }
+
+        // Full image path of a process, read with PROCESS_QUERY_LIMITED_INFORMATION only (no memory access).
+        public static string ImagePath(int pid)
+        {
+            IntPtr h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid);
+            if (h == IntPtr.Zero) return null;
+            try
+            {
+                var sb = new StringBuilder(1024);
+                uint size = (uint)sb.Capacity;
+                if (!QueryFullProcessImageName(h, 0, sb, ref size)) return null;
+                return sb.ToString(0, (int)size);
+            }
+            catch
+            {
+                return null;
+            }
+            finally
+            {
+                CloseHandle(h);
+            }
+        }
+
+        // True while a full-screen program or a presentation is running (QUNS_BUSY, QUNS_RUNNING_D3D_FULL_SCREEN,
+        // QUNS_PRESENTATION_MODE, QUNS_APP).
+        public static bool UserIsBusyFullScreen()
+        {
+            try
+            {
+                int state;
+                if (SHQueryUserNotificationState(out state) != 0) return false;
+                return state == 2 || state == 3 || state == 4 || state == 7;
+            }
+            catch
+            {
+                return false;
+            }
+        }
+
+        // Seconds since the last keyboard or mouse input in this session; 0 when Windows cannot say.
+        public static int IdleSeconds()
+        {
+            var info = new LASTINPUTINFO();
+            info.cbSize = (uint)Marshal.SizeOf(typeof(LASTINPUTINFO));
+            if (!GetLastInputInfo(ref info)) return 0;
+            uint idleMs = unchecked((uint)Environment.TickCount - info.dwTime);
+            return (int)(idleMs / 1000);
+        }
 
         public static void TryEnablePerMonitorDpi()
         {
@@ -978,6 +1166,328 @@ namespace CloseToTrayHelper
         }
     }
 
+    public sealed class RestartInputs
+    {
+        public bool Enabled;
+        public bool Manual;
+        public bool BrowserRunning;
+        public int WindowCount;
+        public bool AnyWindowShown;
+        public bool CanRelaunch;
+        public bool Busy;
+        public bool CliRunning;
+        public int CliQuietSeconds = int.MaxValue;
+        public int CliQuietRequiredSeconds;
+        public bool FullScreenBusy;
+        public bool MediaPlaying;
+        public bool NoExitSameProcess;
+        public double SharedGB = -1;
+        public double ThresholdGB;
+        public double UptimeHours = -1;
+        public double AfterHours;
+        public int IdleSeconds;
+        public int IdleRequiredSeconds;
+        public DateTime NowUtc;
+        public DateTime BackoffUntilUtc = DateTime.MinValue;
+    }
+
+    // Decides whether the browser may be restarted now. Pure: no window, process or clock access.
+    public static class RestartPolicy
+    {
+        public const string Restart = "restart";
+
+        public static string Decide(RestartInputs i)
+        {
+            if (i == null) return "invalid";
+            if (!i.BrowserRunning) return "not-running";
+            if (i.WindowCount <= 0) return "no-windows";
+            // Windows closed one at a time come back only as the last one, so several windows are never restarted.
+            if (i.WindowCount > 1) return "multi-window";
+            if (!i.CanRelaunch) return "no-relaunch-path";
+            if (i.Busy) return "busy";
+            if (i.CliRunning) return "cli-running";
+            if (i.Manual) return Restart;
+            if (!i.Enabled) return "off";
+            if (i.NowUtc < i.BackoffUntilUtc) return "backoff";
+            if (i.NoExitSameProcess) return "no-exit-earlier";
+            bool byMemory = i.ThresholdGB > 0 && i.SharedGB >= i.ThresholdGB;
+            bool byTime = i.AfterHours > 0 && i.UptimeHours >= i.AfterHours;
+            if (!byMemory && !byTime)
+            {
+                if (i.ThresholdGB > 0 && i.SharedGB < 0 && i.AfterHours <= 0) return "unmeasurable";
+                return "below-threshold";
+            }
+            if (i.CliQuietSeconds < i.CliQuietRequiredSeconds) return "cli-recent";
+            if (i.AnyWindowShown) return "window-open";
+            if (i.FullScreenBusy) return "full-screen";
+            // Sound from the browser (music, a video, a call) means it is in use without keyboard or mouse input.
+            if (i.MediaPlaying) return "media-playing";
+            if (i.IdleSeconds < i.IdleRequiredSeconds) return "not-idle";
+            return Restart;
+        }
+
+        // A balloon is worth showing when memory is twice the threshold (twice 4 GB when the memory trigger is off)
+        // and no restart is starting. It also appears while automatic restart is turned off.
+        public static bool ShouldWarn(RestartInputs i, string decision)
+        {
+            if (i == null || i.Manual) return false;
+            // "audio-check" is a restart waiting only for the sound probe's answer (a fraction of a second).
+            if (decision == Restart || decision == "audio-check" || decision == "not-running" || decision == "busy") return false;
+            double basis = i.ThresholdGB > 0 ? i.ThresholdGB : 4.0;
+            return i.SharedGB >= 2 * basis;
+        }
+
+        // Table of fixed cases for -PolicyTest and -SelfTest: "ok=<bool>;cases=<n>;failed=<names>".
+        public static string RunTable()
+        {
+            var failed = new List<string>();
+            int count = 0;
+            DateTime now = new DateTime(2026, 1, 1, 12, 0, 0, DateTimeKind.Utc);
+            Func<RestartInputs> baseCase = () =>
+            {
+                var b = new RestartInputs();
+                b.Enabled = true;
+                b.BrowserRunning = true;
+                b.WindowCount = 1;
+                b.CanRelaunch = true;
+                b.SharedGB = 5;
+                b.ThresholdGB = 4;
+                b.UptimeHours = 10;
+                b.AfterHours = 0;
+                b.IdleSeconds = 900;
+                b.IdleRequiredSeconds = 600;
+                b.CliQuietSeconds = int.MaxValue;
+                b.CliQuietRequiredSeconds = 900;
+                b.NowUtc = now;
+                return b;
+            };
+            Action<string, RestartInputs, string> check = (name, input, expected) =>
+            {
+                count++;
+                string got = Decide(input);
+                if (got != expected) failed.Add(name + ":" + got);
+            };
+            Action<string, RestartInputs, bool> warn = (name, input, expected) =>
+            {
+                count++;
+                if (ShouldWarn(input, Decide(input)) != expected) failed.Add(name);
+            };
+            RestartInputs c;
+            c = baseCase(); check("memory-idle-in-tray-restarts", c, Restart);
+            c = baseCase(); c.SharedGB = 4; check("equal-threshold-restarts", c, Restart);
+            c = baseCase(); c.SharedGB = 1; check("below-threshold", c, "below-threshold");
+            c = baseCase(); c.IdleSeconds = 60; check("not-idle", c, "not-idle");
+            c = baseCase(); c.IdleSeconds = 600; check("idle-boundary-restarts", c, Restart);
+            c = baseCase(); c.CliRunning = true; check("cli-running", c, "cli-running");
+            c = baseCase(); c.CliQuietSeconds = 60; check("cli-recent", c, "cli-recent");
+            c = baseCase(); c.CliQuietSeconds = 900; check("cli-quiet-boundary-restarts", c, Restart);
+            c = baseCase(); c.AnyWindowShown = true; check("window-open", c, "window-open");
+            c = baseCase(); c.FullScreenBusy = true; check("full-screen", c, "full-screen");
+            c = baseCase(); c.MediaPlaying = true; check("media-playing", c, "media-playing");
+            c = baseCase(); c.WindowCount = 2; check("multi-window", c, "multi-window");
+            c = baseCase(); c.Enabled = false; check("off", c, "off");
+            c = baseCase(); c.BackoffUntilUtc = now.AddHours(1); check("backoff", c, "backoff");
+            c = baseCase(); c.BackoffUntilUtc = now.AddHours(-1); check("backoff-over", c, Restart);
+            c = baseCase(); c.NoExitSameProcess = true; check("no-exit-earlier", c, "no-exit-earlier");
+            c = baseCase(); c.BrowserRunning = false; check("not-running", c, "not-running");
+            c = baseCase(); c.WindowCount = 0; check("no-windows", c, "no-windows");
+            c = baseCase(); c.CanRelaunch = false; check("no-relaunch-path", c, "no-relaunch-path");
+            c = baseCase(); c.Busy = true; check("busy", c, "busy");
+            c = baseCase(); c.Manual = true; c.Enabled = false; c.SharedGB = 0.1; c.IdleSeconds = 0; c.AnyWindowShown = true;
+            c.CliQuietSeconds = 0; c.FullScreenBusy = true; c.BackoffUntilUtc = now.AddHours(1); c.NoExitSameProcess = true;
+            c.MediaPlaying = true;
+            check("manual-overrides-the-automatic-conditions", c, Restart);
+            c = baseCase(); c.Manual = true; c.Busy = true; check("manual-waits-when-busy", c, "busy");
+            c = baseCase(); c.Manual = true; c.CliRunning = true; check("manual-respects-a-running-cli", c, "cli-running");
+            c = baseCase(); c.Manual = true; c.CanRelaunch = false; check("manual-needs-relaunch-path", c, "no-relaunch-path");
+            c = baseCase(); c.Manual = true; c.WindowCount = 2; check("manual-needs-one-window", c, "multi-window");
+            c = baseCase(); c.Manual = true; c.WindowCount = 0; check("manual-needs-a-window", c, "no-windows");
+            c = baseCase(); c.SharedGB = -1; check("unmeasurable", c, "unmeasurable");
+            c = baseCase(); c.SharedGB = -1; c.AfterHours = 24; c.UptimeHours = 30; check("uptime-restarts", c, Restart);
+            c = baseCase(); c.SharedGB = -1; c.AfterHours = 24; c.UptimeHours = 5; check("uptime-below", c, "below-threshold");
+            c = baseCase(); c.ThresholdGB = 0; c.SharedGB = 100; check("memory-trigger-off", c, "below-threshold");
+            c = baseCase(); c.SharedGB = 9; c.IdleSeconds = 60; warn("warn-when-high-and-user-active", c, true);
+            c = baseCase(); c.SharedGB = 9; warn("no-warn-when-restarting", c, false);
+            c = baseCase(); c.SharedGB = 9; c.IdleSeconds = 60; c.Enabled = false; warn("warn-even-when-off", c, true);
+            c = baseCase(); c.SharedGB = 7; c.IdleSeconds = 60; warn("no-warn-below-twice", c, false);
+            c = baseCase(); c.SharedGB = 9; c.MediaPlaying = true; warn("warn-when-high-and-media-playing", c, true);
+            c = baseCase(); c.SharedGB = 9; count++; if (ShouldWarn(c, "audio-check")) failed.Add("no-warn-while-checking-sound");
+            c = baseCase(); c.ThresholdGB = 0; c.SharedGB = 9; warn("warn-with-memory-trigger-off", c, true);
+            c = baseCase(); c.SharedGB = 9; c.Manual = true; c.CliRunning = true; warn("no-warn-for-manual", c, false);
+            return string.Format("ok={0};cases={1};failed={2}", failed.Count == 0, count, string.Join(",", failed.ToArray()));
+        }
+    }
+
+    // Whether a process has an audio session that is playing or recording now (Core Audio session API). An automatic
+    // restart would cut off music, a video or a call that runs without keyboard or mouse input. Any failure reads as
+    // "nothing playing", so a broken audio stack never blocks restarts for good.
+    public static class AudioActivity
+    {
+        [ComImport, Guid("BCDE0395-E52F-467C-8E3D-C4579291692E")]
+        private class MMDeviceEnumeratorComObject { }
+
+        [ComImport, Guid("A95664D2-9614-4F35-A746-DE8DB63617E6"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+        private interface IMMDeviceEnumerator
+        {
+            [PreserveSig] int EnumAudioEndpoints(int dataFlow, int stateMask, out IMMDeviceCollection devices);
+        }
+
+        [ComImport, Guid("0BD7A1BE-7A1A-44DB-8397-CC5392387B5E"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+        private interface IMMDeviceCollection
+        {
+            [PreserveSig] int GetCount(out int count);
+            [PreserveSig] int Item(int index, out IMMDevice device);
+        }
+
+        [ComImport, Guid("D666063F-1587-4E43-81F1-B948E807363F"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+        private interface IMMDevice
+        {
+            [PreserveSig] int Activate(ref Guid iid, int clsCtx, IntPtr activationParams, [MarshalAs(UnmanagedType.IUnknown)] out object iface);
+        }
+
+        [ComImport, Guid("77AA99A0-1BD6-484F-8BC7-2C654C9A9B6F"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+        private interface IAudioSessionManager2
+        {
+            [PreserveSig] int GetAudioSessionControl(IntPtr sessionGuid, int streamFlags, out IntPtr sessionControl);
+            [PreserveSig] int GetSimpleAudioVolume(IntPtr sessionGuid, int streamFlags, out IntPtr audioVolume);
+            [PreserveSig] int GetSessionEnumerator(out IAudioSessionEnumerator sessions);
+        }
+
+        [ComImport, Guid("E2F5BB11-0570-40CA-ACDD-3AA01277DEE8"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+        private interface IAudioSessionEnumerator
+        {
+            [PreserveSig] int GetCount(out int count);
+            [PreserveSig] int GetSession(int index, out IAudioSessionControl2 session);
+        }
+
+        [ComImport, Guid("BFB7FF88-7239-4FC9-8FA2-07C950BE9C6D"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+        private interface IAudioSessionControl2
+        {
+            [PreserveSig] int GetState(out int state);
+            [PreserveSig] int GetDisplayName(out IntPtr name);
+            [PreserveSig] int SetDisplayName(IntPtr name, IntPtr eventContext);
+            [PreserveSig] int GetIconPath(out IntPtr path);
+            [PreserveSig] int SetIconPath(IntPtr path, IntPtr eventContext);
+            [PreserveSig] int GetGroupingParam(out Guid groupingId);
+            [PreserveSig] int SetGroupingParam(IntPtr groupingId, IntPtr eventContext);
+            [PreserveSig] int RegisterAudioSessionNotification(IntPtr client);
+            [PreserveSig] int UnregisterAudioSessionNotification(IntPtr client);
+            [PreserveSig] int GetSessionIdentifier(out IntPtr id);
+            [PreserveSig] int GetSessionInstanceIdentifier(out IntPtr id);
+            [PreserveSig] int GetProcessId(out uint pid);
+        }
+
+        private const int EDataFlowAll = 2;            // render and capture endpoints
+        private const int DeviceStateActive = 1;
+        private const int ClsctxAll = 23;
+        private const int AudioSessionStateActive = 1;
+
+        // True when one of the given processes has an active audio session on any active endpoint.
+        public static bool AnyActive(HashSet<int> pids)
+        {
+            string error;
+            return Probe(pids, out error);
+        }
+
+        // Same, and says why the check could not run ("" when it ran).
+        public static bool Probe(HashSet<int> pids, out string error)
+        {
+            error = "";
+            if (pids == null || pids.Count == 0) return false;
+            var held = new List<object>();
+            try
+            {
+                var enumerator = (IMMDeviceEnumerator)new MMDeviceEnumeratorComObject();
+                held.Add(enumerator);
+                IMMDeviceCollection devices;
+                if (enumerator.EnumAudioEndpoints(EDataFlowAll, DeviceStateActive, out devices) != 0 || devices == null) return false;
+                held.Add(devices);
+                int deviceCount;
+                if (devices.GetCount(out deviceCount) != 0) return false;
+                Guid managerId = typeof(IAudioSessionManager2).GUID;
+                for (int d = 0; d < deviceCount; d++)
+                {
+                    IMMDevice device;
+                    if (devices.Item(d, out device) != 0 || device == null) continue;
+                    held.Add(device);
+                    object managerObject;
+                    if (device.Activate(ref managerId, ClsctxAll, IntPtr.Zero, out managerObject) != 0 || managerObject == null) continue;
+                    held.Add(managerObject);
+                    IAudioSessionEnumerator sessions;
+                    if (((IAudioSessionManager2)managerObject).GetSessionEnumerator(out sessions) != 0 || sessions == null) continue;
+                    held.Add(sessions);
+                    int sessionCount;
+                    if (sessions.GetCount(out sessionCount) != 0) continue;
+                    for (int s = 0; s < sessionCount; s++)
+                    {
+                        IAudioSessionControl2 session;
+                        if (sessions.GetSession(s, out session) != 0 || session == null) continue;
+                        held.Add(session);
+                        int state;
+                        uint pid;
+                        if (session.GetState(out state) != 0 || state != AudioSessionStateActive) continue;
+                        if (session.GetProcessId(out pid) != 0) continue;
+                        if (pids.Contains((int)pid)) return true;
+                    }
+                }
+                return false;
+            }
+            catch (Exception ex)
+            {
+                error = ex.GetType().Name;
+                return false;
+            }
+            finally
+            {
+                for (int n = held.Count - 1; n >= 0; n--)
+                {
+                    try { Marshal.ReleaseComObject(held[n]); } catch { }
+                }
+            }
+        }
+    }
+
+    public static class MemoryProbe
+    {
+        // Largest shared commit, in bytes, over the given processes; -1 when none could be read.
+        public static long MaxSharedCommit(IEnumerable<int> pids)
+        {
+            long best = -1;
+            foreach (int pid in pids)
+            {
+                long v = SharedCommit(pid);
+                if (v > best) best = v;
+            }
+            return best;
+        }
+
+        // Opens the process only with PROCESS_QUERY_LIMITED_INFORMATION (the right Task Manager uses).
+        public static long SharedCommit(int pid)
+        {
+            IntPtr h = NativeMethods.OpenProcess(NativeMethods.PROCESS_QUERY_LIMITED_INFORMATION, false, pid);
+            if (h == IntPtr.Zero) return -1;
+            try
+            {
+                var c = new PROCESS_MEMORY_COUNTERS_EX2();
+                uint size = (uint)Marshal.SizeOf(typeof(PROCESS_MEMORY_COUNTERS_EX2));
+                c.cb = size;
+                if (!NativeMethods.GetProcessMemoryInfoEx2(h, ref c, size)) return -1;
+                // Without the EX2 structure the call still succeeds but writes a smaller cb back: no value then.
+                if (c.cb < size) return -1;
+                if (c.SharedCommitUsage > (ulong)long.MaxValue) return long.MaxValue;
+                return (long)c.SharedCommitUsage;
+            }
+            catch
+            {
+                return -1;
+            }
+            finally
+            {
+                NativeMethods.CloseHandle(h);
+            }
+        }
+    }
+
     public sealed class AsideTrayContext : ApplicationContext
     {
         private const string APP_TITLE = "\ud2b8\ub808\uc774 \ub3c4\uc6b0\ubbf8";
@@ -994,6 +1504,44 @@ namespace CloseToTrayHelper
         private const string MENU_AUTOSTART = "\ub3c4\uc6b0\ubbf8 \uc2dc\uc791 \uc2dc \ube0c\ub77c\uc6b0\uc800\ub3c4 \uc790\ub3d9 \uc2dc\uc791";
         private const string MENU_EXIT = "\ud2b8\ub808\uc774 \ub3c4\uc6b0\ubbf8 \uc885\ub8cc (\ube0c\ub77c\uc6b0\uc800 \ucc3d \ubcf5\uc6d0)";
 
+        private const string MENU_RESTART_NOW = "\ube0c\ub77c\uc6b0\uc800 \ub2e4\uc2dc \uc2dc\uc791 (\uba54\ubaa8\ub9ac \uc815\ub9ac)";
+        private const string MENU_AUTO_RESTART = "\uba54\ubaa8\ub9ac\uac00 \ub9ce\uc73c\uba74 \uc790\ub9ac \ube44\uc6b4 \uc0ac\uc774 \uc790\ub3d9 \ub2e4\uc2dc \uc2dc\uc791";
+        private const string MEM_INFO_PREFIX = "\ube0c\ub77c\uc6b0\uc800\uac00 \ubd99\uc7a1\uc740 \uba54\ubaa8\ub9ac: ";
+        private const string MEM_INFO_UNKNOWN = "\ube0c\ub77c\uc6b0\uc800\uac00 \ubd99\uc7a1\uc740 \uba54\ubaa8\ub9ac: \uce21\uc815 \ubd88\uac00";
+        private const string BALLOON_HIGH = "\ube0c\ub77c\uc6b0\uc800\uac00 \ubd99\uc7a1\uc740 \uba54\ubaa8\ub9ac\uac00 \ub9ce\uc2b5\ub2c8\ub2e4. \ud2b8\ub808\uc774 \uba54\ub274\uc5d0\uc11c \ub2e4\uc2dc \uc2dc\uc791\ud558\uba74 \ud480\ub9bd\ub2c8\ub2e4.";
+
+        private const string BALLOON_PROMPT = "\ube0c\ub77c\uc6b0\uc800\uc758 \ud398\uc774\uc9c0\uac00 \ub2eb\uae30 \uc804\uc5d0 \ud655\uc778\uc744 \ubb3b\uace0 \uc788\uc2b5\ub2c8\ub2e4. 30\ubd84 \uc548\uc5d0 \ube0c\ub77c\uc6b0\uc800\uac00 \ub2eb\ud788\uba74(\ub098\uac00\uae30) \ub2e4\uc2dc \uc5fd\ub2c8\ub2e4. \ucde8\uc18c\ud558\uba74 \ube0c\ub77c\uc6b0\uc800\ub294 \uadf8\ub300\ub85c \ub450\uc9c0\ub9cc, \uadf8 30\ubd84 \ub3d9\uc548\uc740 \ube0c\ub77c\uc6b0\uc800\ub97c \ub2eb\uc73c\uba74 \ub2e4\uc2dc \uc5f4\ub9ac\uace0 \uba54\ub274\uc758 \ub2e4\uc2dc \uc2dc\uc791\uc740 \uc4f8 \uc218 \uc5c6\uc2b5\ub2c8\ub2e4.";
+        private const string BALLOON_NO_EXIT = "\ube0c\ub77c\uc6b0\uc800\uac00 \ucc3d\uc744 \ub2eb\uc544\ub3c4 \ub05d\ub098\uc9c0 \uc54a\uc544 \uba54\ubaa8\ub9ac\ub97c \ud480\uc9c0 \ubabb\ud588\uc2b5\ub2c8\ub2e4. \ube0c\ub77c\uc6b0\uc800\ub97c \uc9c1\uc811 \ub05d\ub0b4 \uc8fc\uc138\uc694.";
+        private const string BALLOON_FAILED = "\ube0c\ub77c\uc6b0\uc800\ub97c \ub2e4\uc2dc \uc5f4\uc9c0 \ubabb\ud588\uc2b5\ub2c8\ub2e4. \ud2b8\ub808\uc774 \uba54\ub274\uc758 \ube0c\ub77c\uc6b0\uc800 \uc2dc\uc791\uc744 \ub20c\ub7ec \uc8fc\uc138\uc694.";
+        private const string BALLOON_MULTI = "\ucc3d\uc774 \ub458 \uc774\uc0c1\uc774\uba74 \ub2e4\uc2dc \uc2dc\uc791\ud558\uc9c0 \uc54a\uc2b5\ub2c8\ub2e4(\ub9c8\uc9c0\ub9c9 \ucc3d\ub9cc \ub418\uc0b4\uc544\ub098\uae30 \ub54c\ubb38). \ucc3d\uc744 \ud558\ub098\ub9cc \ub0a8\uae30\uace0 \ub2e4\uc2dc \uc2dc\ub3c4\ud558\uc138\uc694.";
+        private const string BALLOON_CLI = "Aside CLI\uac00 \uc791\uc5c5 \uc911\uc774\ub77c \ub2e4\uc2dc \uc2dc\uc791\ud558\uc9c0 \uc54a\uc558\uc2b5\ub2c8\ub2e4.";
+        private const string BALLOON_NO_PATH = "\ube0c\ub77c\uc6b0\uc800\ub97c \ub2e4\uc2dc \ub744\uc6b8 \uc2e4\ud589 \ud30c\uc77c\uc744 \ucc3e\uc9c0 \ubabb\ud574 \ub2e4\uc2dc \uc2dc\uc791\ud558\uc9c0 \uc54a\uc558\uc2b5\ub2c8\ub2e4. \uc544\ubb34\uac83\ub3c4 \ub2eb\uc9c0 \uc54a\uc558\uc2b5\ub2c8\ub2e4.";
+        private const string BALLOON_NO_WINDOWS = "\uc5f4\ub9b0 \ube0c\ub77c\uc6b0\uc800 \ucc3d\uc774 \uc5c6\uc5b4 \ub2e4\uc2dc \uc2dc\uc791\ud558\uc9c0 \uc54a\uc558\uc2b5\ub2c8\ub2e4.";
+        private const string BALLOON_BUSY = "\ube0c\ub77c\uc6b0\uc800\ub97c \uc2dc\uc791\ud558\uac70\ub098 \ub2e4\uc2dc \uc2dc\uc791\ud558\ub294 \uc911\uc785\ub2c8\ub2e4(\ud398\uc774\uc9c0 \ud655\uc778 \ucc3d\uc758 \ub2f5\uc744 \uae30\ub2e4\ub9ac\ub294 \uc911\uc774\uba74 \ucd5c\ub300 30\ubd84). \ub05d\ub09c \ub4a4\uc5d0 \ub2e4\uc2dc \uc2dc\ub3c4\ud558\uc138\uc694.";
+        private const string BALLOON_HIDDEN_WINDOW = "\ubcf4\uc774\uc9c0 \uc54a\ub294 \ube0c\ub77c\uc6b0\uc800 \ucc3d\uc774 \uc788\uc5b4 \ub2e4\uc2dc \uc2dc\uc791\ud558\uc9c0 \uc54a\uc558\uc2b5\ub2c8\ub2e4. \uba54\ubaa8\ub9ac\ub97c \ud480\ub824\uba74 \ube0c\ub77c\uc6b0\uc800\ub97c \uc9c1\uc811 \ub05d\ub0b8 \ub4a4 \ub2e4\uc2dc \uc5ec\uc138\uc694.";
+        private const string BALLOON_NOT_RUNNING = "\ube0c\ub77c\uc6b0\uc800\uac00 \uc2e4\ud589 \uc911\uc774 \uc544\ub2c8\uc5b4\uc11c \ub2e4\uc2dc \uc2dc\uc791\ud558\uc9c0 \uc54a\uc558\uc2b5\ub2c8\ub2e4.";
+
+        private const int POLICY_INTERVAL_MS = 60000;
+        private const int CLOSE_WAIT_MS = 60000;
+        private const int REHIDE_GRACE_MS = 60000;
+        private const int SLOW_EXIT_WAIT_MS = 60000;
+        private const int PROMPT_WAIT_MS = 1800000;
+        private const int CLI_QUIET_SECONDS = 900;
+        private const int RELAUNCH_SETTLE_MS = 30000;
+        private const int SESSION_END_CONFIRM_MS = 5000;
+        private const int AUDIO_RESULT_FRESH_MS = 5000;
+        private const int KIND_OTHER = 0;
+        private const int KIND_BROWSER = 1;
+        private const int KIND_CLI = 2;
+        private const int KIND_UNKNOWN = -1;   // the process could not be read; not cached
+        private const int SIGNAL_SHOW_FOR_PROMPT = 1;
+        private const int SIGNAL_BALLOON_PROMPT = 2;
+        private const int SIGNAL_BALLOON_NO_EXIT = 4;
+        private const int SIGNAL_BALLOON_FAILED = 8;
+        private const int SIGNAL_AUDIO_DONE = 16;
+        private static readonly TimeSpan BACKOFF_FAILED = TimeSpan.FromHours(6);
+        private static readonly TimeSpan COOLDOWN_AFTER_RESTART = TimeSpan.FromHours(1);
+
         private readonly string _asideExe;
         private readonly string _asideUpScript;
         private readonly string _prefsPath;
@@ -1003,8 +1551,12 @@ namespace CloseToTrayHelper
         private HideMode _mode;
         private bool _autoStartAside;
         private bool _closeToTray;
+        private bool _autoRestart;
+        private double _restartAtGB;
+        private double _restartAfterHours;
+        private int _restartIdleMinutes;
 
-        private readonly Dictionary<int, bool> _pidCache = new Dictionary<int, bool>();
+        private readonly Dictionary<int, int> _pidCache = new Dictionary<int, int>();
         private readonly Dictionary<IntPtr, HiddenEntry> _hidden = new Dictionary<IntPtr, HiddenEntry>();
         private readonly TaskbarBridge _taskbar = new TaskbarBridge();
         private readonly uint _internalHideMsg;
@@ -1019,6 +1571,9 @@ namespace CloseToTrayHelper
         private ToolStripMenuItem _miCloseToTray;
         private ToolStripMenuItem _miStartup;
         private ToolStripMenuItem _miAutoStart;
+        private ToolStripMenuItem _miMemInfo;
+        private ToolStripMenuItem _miRestartNow;
+        private ToolStripMenuItem _miAutoRestart;
         private ToolStripMenuItem _miExit;
         private Font _showBoldFont;
         private System.Windows.Forms.Timer _timer;
@@ -1030,6 +1585,30 @@ namespace CloseToTrayHelper
         private bool _launchingAside = false;
         private bool _cleanedUp = false;
 
+        private volatile bool _restarting = false;
+        private DateTime _lastPolicyCheckUtc = DateTime.MinValue;
+        private DateTime _lastBalloonUtc = DateTime.MinValue;
+        private long _backoffUntilTicks = 0;
+        private long _rehideUntilTicks = 0;
+        private long _relaunchedTicks = 0;
+        private double _lastSharedGB = -1;
+        private string _lastDecision = "";
+        private string _lastRestartResult = "";
+        private readonly Dictionary<IntPtr, int> _rehideCounts = new Dictionary<IntPtr, int>();
+        private bool _cliAlive = false;
+        private DateTime _lastCliSeenUtc = DateTime.MinValue;
+        private bool _exitPending = false;
+        private volatile bool _restartCritical = false;
+        private volatile bool _sessionEnded = false;   // WM_ENDSESSION: Windows is really signing out or shutting down
+        private long _sessionEndingTicks = 0;          // WM_QUERYENDSESSION: asked, and may still be cancelled
+        private volatile bool _showAfterRestart = false;
+        private volatile int _noExitMainPid = 0;
+        private long _noExitMainStartTicks = 0;
+        private int _audioProbeRunning = 0;
+        private long _audioResultTicks = 0;
+        private volatile bool _audioResultPlaying = false;
+        private int _uiSignals = 0;
+
         public AsideTrayContext(
             string asideExe,
             string asideUpScript,
@@ -1039,6 +1618,10 @@ namespace CloseToTrayHelper
             HideMode initialMode,
             bool autoStartAside,
             bool closeToTray,
+            bool autoRestart,
+            double restartAtGB,
+            double restartAfterHours,
+            int restartIdleMinutes,
             bool startAsideNow)
         {
             _asideExe = asideExe ?? "";
@@ -1049,6 +1632,13 @@ namespace CloseToTrayHelper
             _mode = initialMode;
             _autoStartAside = autoStartAside;
             _closeToTray = closeToTray;
+            _autoRestart = autoRestart;
+            _restartAtGB = restartAtGB < 0 ? 0 : restartAtGB;
+            _restartAfterHours = restartAfterHours < 0 ? 0 : restartAfterHours;
+            _restartIdleMinutes = restartIdleMinutes < 1 ? 1 : restartIdleMinutes;
+            // The helper cannot see CLI runs from before it started: its start counts as CLI activity, so the first
+            // automatic restart needs 15 minutes of CLI quiet that this instance has watched.
+            _lastCliSeenUtc = DateTime.UtcNow;
 
             BuildTrayUi();
 
@@ -1073,6 +1663,7 @@ namespace CloseToTrayHelper
             _closeInterceptor.Enabled = _closeToTray;
 
             SystemEvents.SessionEnding += OnSessionEnding;
+            SystemEvents.SessionEnded += OnSessionEnded;
             AppDomain.CurrentDomain.ProcessExit += OnProcessExit;
             Application.ApplicationExit += OnApplicationExit;
 
@@ -1109,6 +1700,15 @@ namespace CloseToTrayHelper
             _miStart = new ToolStripMenuItem(MENU_START);
             _miStart.Click += (s, e) => LaunchAsideAsync();
 
+            _miMemInfo = new ToolStripMenuItem(MEM_INFO_UNKNOWN);
+            _miMemInfo.Enabled = false;
+
+            _miRestartNow = new ToolStripMenuItem(MENU_RESTART_NOW);
+            _miRestartNow.Click += (s, e) => RequestRestart(true);
+
+            _miAutoRestart = new ToolStripMenuItem(MENU_AUTO_RESTART);
+            _miAutoRestart.Click += (s, e) => ToggleAutoRestart();
+
             _miModeDel = new ToolStripMenuItem(MENU_MODE_DEL);
             _miModeDel.Click += (s, e) => SwitchMode(HideMode.DeleteTab);
 
@@ -1130,6 +1730,10 @@ namespace CloseToTrayHelper
             _menu.Items.Add(_miShow);
             _menu.Items.Add(_miHide);
             _menu.Items.Add(_miStart);
+            _menu.Items.Add(new ToolStripSeparator());
+            _menu.Items.Add(_miMemInfo);
+            _menu.Items.Add(_miRestartNow);
+            _menu.Items.Add(_miAutoRestart);
             _menu.Items.Add(new ToolStripSeparator());
             _menu.Items.Add(_miModeDel);
             _menu.Items.Add(_miModeHide);
@@ -1187,6 +1791,9 @@ namespace CloseToTrayHelper
                 case TrayIpcCommand.Toggle:
                     ToggleAsideWindows();
                     break;
+                case TrayIpcCommand.RestartBrowser:
+                    RequestRestart(true);
+                    break;
             }
         }
 
@@ -1212,25 +1819,32 @@ namespace CloseToTrayHelper
             catch { return live; }
 
             var seen = new HashSet<int>();
+            bool cli = false;
             foreach (var p in procs)
             {
                 try
                 {
                     int pid = p.Id;
                     seen.Add(pid);
-                    bool isBrowser;
-                    if (!_pidCache.TryGetValue(pid, out isBrowser))
+                    int kind;
+                    if (!_pidCache.TryGetValue(pid, out kind))
                     {
-                        isBrowser = CheckIsAsideBrowserProcess(p);
-                        _pidCache[pid] = isBrowser;
+                        kind = ClassifyAsideProcess(pid);
+                        if (kind != KIND_UNKNOWN) _pidCache[pid] = kind;
                     }
-                    if (isBrowser) live.Add(pid);
+                    if (kind == KIND_BROWSER) live.Add(pid);
+                    else if (kind == KIND_CLI) cli = true;
                 }
                 catch { }
                 finally { p.Dispose(); }
             }
+            // The Aside CLI drives the browser; remember when it was last seen (checked every tick, not only
+            // at the once-a-minute restart check, so the gaps between CLI calls count as activity).
+            _cliAlive = cli;
+            if (cli) _lastCliSeenUtc = DateTime.UtcNow;
 
-            if (_pidCache.Count > 64)
+            // Forget processes that are gone on every pass, so a reused process id is classified again.
+            if (_pidCache.Count > 0)
             {
                 var stale = new List<int>();
                 foreach (var k in _pidCache.Keys)
@@ -1244,17 +1858,26 @@ namespace CloseToTrayHelper
 
         private static bool CheckIsAsideBrowserProcess(Process p)
         {
+            return ClassifyAsideProcess(p.Id) == KIND_BROWSER;
+        }
+
+        // Classifies a process named Aside by its image path, read with PROCESS_QUERY_LIMITED_INFORMATION only:
+        // the browser (Aside.exe under \Application\ or product name "Aside"), the Aside CLI, or something else.
+        private static int ClassifyAsideProcess(int pid)
+        {
             try
             {
-                string path = p.MainModule != null ? p.MainModule.FileName : null;
-                if (string.IsNullOrEmpty(path)) return false;
-                if (path.EndsWith(@"\Application\Aside.exe", StringComparison.OrdinalIgnoreCase)) return true;
+                string path = NativeMethods.ImagePath(pid);
+                if (string.IsNullOrEmpty(path)) return KIND_UNKNOWN;
+                if (path.EndsWith(@"\Application\Aside.exe", StringComparison.OrdinalIgnoreCase)) return KIND_BROWSER;
                 var info = FileVersionInfo.GetVersionInfo(path);
-                return string.Equals(info.ProductName, "Aside", StringComparison.OrdinalIgnoreCase);
+                if (string.Equals(info.ProductName, "Aside", StringComparison.OrdinalIgnoreCase)) return KIND_BROWSER;
+                if (string.Equals(info.ProductName, "Aside CLI", StringComparison.OrdinalIgnoreCase)) return KIND_CLI;
+                return KIND_OTHER;
             }
             catch
             {
-                return false;
+                return KIND_UNKNOWN;
             }
         }
 
@@ -1370,6 +1993,9 @@ namespace CloseToTrayHelper
 
         public void ShowAllAsideWindows()
         {
+            Interlocked.Exchange(ref _rehideUntilTicks, 0);
+            // During a restart a Show also means: leave the reopened window on screen.
+            if (_restarting || RelaunchSettling()) _showAfterRestart = true;
             _suppressHideUntilUtc = DateTime.UtcNow.AddMilliseconds(1500);
             var pids = GetAsideBrowserPids();
             var wins = EnumAsideMainWindows(pids);
@@ -1477,6 +2103,23 @@ namespace CloseToTrayHelper
         {
             if (_cleanedUp) return;
 
+            // Requests from the other threads first, so a prompt window is shown before a pending exit. Balloons are
+            // dropped when the helper is about to exit: the icon goes with it, and they would promise a reopen that an
+            // exiting helper cannot do.
+            int signals = Interlocked.Exchange(ref _uiSignals, 0);
+            if (signals != 0)
+            {
+                if (_exitPending && !_restartCritical) signals &= SIGNAL_SHOW_FOR_PROMPT;
+                HandleRestartSignals(signals);
+            }
+            // An exit asked for while the browser was closed for a restart happens once it is open again.
+            if (_exitPending && !_restartCritical)
+            {
+                _exitPending = false;
+                RequestExit();
+                return;
+            }
+
             var dead = new List<IntPtr>();
             foreach (var h in _hidden.Keys)
             {
@@ -1490,6 +2133,11 @@ namespace CloseToTrayHelper
             var pids = GetAsideBrowserPids();
             var wins = EnumAsideMainWindows(pids);
             var now = DateTime.UtcNow;
+
+            // After a memory restart of a browser that was in the tray, put its new windows back for a short
+            // while: the browser restores them at normal size. Opening the browser from the tray (Show) ends this
+            // early; input in other programs does not.
+            bool rehiding = now.Ticks < Interlocked.Read(ref _rehideUntilTicks);
 
             var allTracked = new HashSet<IntPtr>(wins);
             foreach (var h in _hidden.Keys) allTracked.Add(h);
@@ -1547,7 +2195,32 @@ namespace CloseToTrayHelper
                     {
                         ApplyHide(h, _mode);
                     }
+                    else if (rehiding && NativeMethods.IsWindowVisible(h) && !NativeMethods.IsIconic(h))
+                    {
+                        // Minimize the reopened window; the next tick hides it like any minimized window. At most
+                        // twice per window, so a window the user brings back (taskbar pin, Alt+Tab) stays open. If
+                        // the browser took the foreground as it opened, minimize it the way the close button does
+                        // (SW_MINIMIZE gives the foreground to the window behind it); otherwise leave the foreground
+                        // alone (SW_SHOWMINNOACTIVE).
+                        int done;
+                        _rehideCounts.TryGetValue(h, out done);
+                        if (done < 2)
+                        {
+                            _rehideCounts[h] = done + 1;
+                            uint winPid, fgPid;
+                            NativeMethods.GetWindowThreadProcessId(h, out winPid);
+                            NativeMethods.GetWindowThreadProcessId(NativeMethods.GetForegroundWindow(), out fgPid);
+                            int cmd = fgPid != 0 && fgPid == winPid ? NativeMethods.SW_MINIMIZE : NativeMethods.SW_SHOWMINNOACTIVE;
+                            NativeMethods.ShowWindowAsync(h, cmd);
+                        }
+                    }
                 }
+            }
+
+            if ((now - _lastPolicyCheckUtc).TotalMilliseconds >= POLICY_INTERVAL_MS)
+            {
+                _lastPolicyCheckUtc = now;
+                try { CheckRestartPolicy(pids, wins, false); } catch { }
             }
 
             UpdateTooltip(pids.Count > 0);
@@ -1574,6 +2247,11 @@ namespace CloseToTrayHelper
             _miCloseToTray.Checked = _closeToTray;
             _miStartup.Checked = IsStartupInstalled();
             _miAutoStart.Checked = _autoStartAside;
+            _miAutoRestart.Checked = _autoRestart;
+            _miRestartNow.Enabled = running && !_restarting && !_launchingAside;
+            // While the browser is closed for a restart the helper finishes that first, so exiting is not offered.
+            _miExit.Enabled = !_restartCritical && !_exitPending;
+            UpdateMemoryInfoItem(GetAsideBrowserPids());
         }
 
         private string GetStartupShortcutPath()
@@ -1635,18 +2313,457 @@ namespace CloseToTrayHelper
             {
                 string dir = Path.GetDirectoryName(_prefsPath);
                 if (!string.IsNullOrEmpty(dir)) Directory.CreateDirectory(dir);
+                var inv = System.Globalization.CultureInfo.InvariantCulture;
                 string json = string.Format(
-                    "{{\"mode\":\"{0}\",\"autoStartAside\":{1},\"closeToTray\":{2}}}",
+                    inv,
+                    "{{\"mode\":\"{0}\",\"autoStartAside\":{1},\"closeToTray\":{2},\"autoRestart\":{3},\"restartAtGB\":{4},\"restartAfterHours\":{5},\"restartIdleMinutes\":{6}}}",
                     _mode == HideMode.HideWindow ? "HideWindow" : "DeleteTab",
                     _autoStartAside ? "true" : "false",
-                    _closeToTray ? "true" : "false");
+                    _closeToTray ? "true" : "false",
+                    _autoRestart ? "true" : "false",
+                    _restartAtGB.ToString("0.###", inv),
+                    _restartAfterHours.ToString("0.###", inv),
+                    _restartIdleMinutes);
                 File.WriteAllText(_prefsPath, json, new UTF8Encoding(false));
             }
             catch { }
         }
 
+        private void ToggleAutoRestart()
+        {
+            _autoRestart = !_autoRestart;
+            SavePrefs();
+        }
+
+        private void RequestRestart(bool manual)
+        {
+            if (_cleanedUp) return;
+            var pids = GetAsideBrowserPids();
+            var wins = EnumAsideMainWindows(pids);
+            CheckRestartPolicy(pids, wins, manual);
+        }
+
+        // Measures the browser, asks RestartPolicy, then starts a restart or shows a balloon.
+        private string CheckRestartPolicy(HashSet<int> pids, List<IntPtr> wins, bool manual)
+        {
+            var now = DateTime.UtcNow;
+            long shared = pids.Count > 0 ? MemoryProbe.MaxSharedCommit(pids) : -1;
+            _lastSharedGB = shared < 0 ? -1 : shared / 1073741824.0;
+
+            bool anyShown = false;
+            foreach (var h in wins)
+            {
+                if (NativeMethods.IsWindowVisible(h) && !NativeMethods.IsIconic(h)) { anyShown = true; break; }
+            }
+            int mainPid = MainPidOf(wins);
+            double quiet = _lastCliSeenUtc == DateTime.MinValue ? double.MaxValue : (now - _lastCliSeenUtc).TotalSeconds;
+
+            var inputs = new RestartInputs();
+            inputs.Enabled = _autoRestart;
+            inputs.Manual = manual;
+            inputs.BrowserRunning = pids.Count > 0;
+            // Every browser window counts, also one hidden by something other than this helper: it would keep the
+            // browser running after the visible one closes. No visible or tracked window means none.
+            inputs.WindowCount = wins.Count == 0 ? 0 : Math.Max(wins.Count, CountBrowserWindows(pids));
+            inputs.AnyWindowShown = anyShown;
+            inputs.CanRelaunch = !string.IsNullOrEmpty(RelaunchExe(mainPid));
+            inputs.Busy = _launchingAside || _restarting;
+            inputs.CliRunning = _cliAlive;
+            inputs.CliQuietSeconds = quiet >= int.MaxValue ? int.MaxValue : (int)Math.Max(0, quiet);
+            inputs.CliQuietRequiredSeconds = CLI_QUIET_SECONDS;
+            inputs.FullScreenBusy = NativeMethods.UserIsBusyFullScreen();
+            inputs.NoExitSameProcess = mainPid != 0 && mainPid == _noExitMainPid
+                && NativeMethods.ProcessStartUtc(mainPid).Ticks == Interlocked.Read(ref _noExitMainStartTicks);
+            inputs.SharedGB = _lastSharedGB;
+            inputs.ThresholdGB = _restartAtGB;
+            inputs.AfterHours = _restartAfterHours;
+            inputs.UptimeHours = _restartAfterHours > 0 ? GetBrowserUptimeHours(pids) : -1;
+            inputs.IdleSeconds = NativeMethods.IdleSeconds();
+            inputs.IdleRequiredSeconds = Math.Max(60, _restartIdleMinutes * 60);
+            inputs.NowUtc = now;
+            inputs.BackoffUntilUtc = new DateTime(Interlocked.Read(ref _backoffUntilTicks), DateTimeKind.Utc);
+
+            string decision = RestartPolicy.Decide(inputs);
+            if (decision == RestartPolicy.Restart && !manual)
+            {
+                // Sound from the browser is asked for only now, when it can change the decision, and on another
+                // thread (this one also serves the mouse hook). A fresh answer decides; otherwise the probe starts
+                // and its answer runs this check again.
+                long age = now.Ticks - Interlocked.Read(ref _audioResultTicks);
+                if (age >= 0 && age < TimeSpan.FromMilliseconds(AUDIO_RESULT_FRESH_MS).Ticks)
+                {
+                    inputs.MediaPlaying = _audioResultPlaying;
+                    decision = RestartPolicy.Decide(inputs);
+                }
+                else
+                {
+                    StartAudioProbe(pids);
+                    decision = "audio-check";
+                }
+            }
+            _lastDecision = decision;
+            if (decision == RestartPolicy.Restart)
+            {
+                StartRestart(wins, mainPid, !anyShown);
+            }
+            else if (manual)
+            {
+                // A hidden extra window cannot be closed from the desktop: say so instead of "keep one window".
+                if (decision == "multi-window") ShowBalloon(CountBrowserWindows(pids) > wins.Count ? BALLOON_HIDDEN_WINDOW : BALLOON_MULTI);
+                else if (decision == "not-running") ShowBalloon(BALLOON_NOT_RUNNING);
+                else if (decision == "cli-running") ShowBalloon(BALLOON_CLI);
+                else if (decision == "no-relaunch-path") ShowBalloon(BALLOON_NO_PATH);
+                else if (decision == "no-windows") ShowBalloon(BALLOON_NO_WINDOWS);
+                else if (decision == "busy") ShowBalloon(BALLOON_BUSY);
+            }
+            else if (RestartPolicy.ShouldWarn(inputs, decision) && (now - _lastBalloonUtc).TotalHours >= 1)
+            {
+                _lastBalloonUtc = now;
+                ShowBalloon(BALLOON_HIGH);
+            }
+            return decision;
+        }
+
+        // Asks Core Audio on a background thread whether the browser plays or records sound, one probe at a time.
+        // The answer is kept with its time and announced to the UI thread, which then runs the policy check again.
+        private void StartAudioProbe(HashSet<int> pids)
+        {
+            var copy = new HashSet<int>(pids);   // before the flag: a failure here must not leave it set
+            if (Interlocked.CompareExchange(ref _audioProbeRunning, 1, 0) != 0) return;
+            try
+            {
+                var probe = new Thread(() =>
+                {
+                    bool playing = false;
+                    try { playing = AudioActivity.AnyActive(copy); }
+                    catch { playing = false; }
+                    finally
+                    {
+                        _audioResultPlaying = playing;
+                        Interlocked.Exchange(ref _audioResultTicks, DateTime.UtcNow.Ticks);
+                        Interlocked.Exchange(ref _audioProbeRunning, 0);
+                        AddSignal(SIGNAL_AUDIO_DONE);
+                    }
+                });
+                probe.IsBackground = true;
+                probe.Name = "AudioProbe";
+                probe.SetApartmentState(ApartmentState.MTA);
+                probe.Start();
+            }
+            catch
+            {
+                Interlocked.Exchange(ref _audioProbeRunning, 0);
+            }
+        }
+
+        private void ShowBalloon(string message)
+        {
+            try { if (_tray != null) _tray.ShowBalloonTip(10000, APP_TITLE, message, ToolTipIcon.Warning); } catch { }
+        }
+
+        private void AddSignal(int bits)
+        {
+            int seen, next;
+            do
+            {
+                seen = _uiSignals;
+                next = seen | bits;
+            } while (Interlocked.CompareExchange(ref _uiSignals, next, seen) != seen);
+        }
+
+        // Runs on the UI thread (Reconcile) for requests the restart thread cannot carry out itself.
+        private void HandleRestartSignals(int signals)
+        {
+            // The sound probe answered: check the policy again in this pass.
+            if ((signals & SIGNAL_AUDIO_DONE) != 0) _lastPolicyCheckUtc = DateTime.MinValue;
+            if ((signals & SIGNAL_SHOW_FOR_PROMPT) != 0) ShowAllAsideWindows();
+            if ((signals & SIGNAL_BALLOON_PROMPT) != 0) ShowBalloon(BALLOON_PROMPT);
+            else if ((signals & SIGNAL_BALLOON_NO_EXIT) != 0) ShowBalloon(BALLOON_NO_EXIT);
+            else if ((signals & SIGNAL_BALLOON_FAILED) != 0) ShowBalloon(BALLOON_FAILED);
+        }
+
+        // The browser process that owns the given window(s); 0 when unknown.
+        private static int MainPidOf(List<IntPtr> wins)
+        {
+            foreach (var h in wins)
+            {
+                uint pid;
+                NativeMethods.GetWindowThreadProcessId(h, out pid);
+                if (pid != 0) return (int)pid;
+            }
+            return 0;
+        }
+
+        // The executable that starts the browser again: the running browser's own image, so the same install comes
+        // back; when that cannot be read, the configured or detected Aside.exe.
+        private string RelaunchExe(int mainPid)
+        {
+            if (mainPid != 0)
+            {
+                string path = NativeMethods.ImagePath(mainPid);
+                if (!string.IsNullOrEmpty(path) && File.Exists(path)) return path;
+            }
+            if (!string.IsNullOrEmpty(_asideExe) && File.Exists(_asideExe)) return _asideExe;
+            return null;
+        }
+
+        private void UpdateMemoryInfoItem(HashSet<int> pids)
+        {
+            if (_miMemInfo == null) return;
+            long shared = pids.Count > 0 ? MemoryProbe.MaxSharedCommit(pids) : -1;
+            _lastSharedGB = shared < 0 ? -1 : shared / 1073741824.0;
+            _miMemInfo.Text = _lastSharedGB < 0
+                ? MEM_INFO_UNKNOWN
+                : MEM_INFO_PREFIX + _lastSharedGB.ToString("0.0", System.Globalization.CultureInfo.InvariantCulture) + " GB";
+        }
+
+        private static double GetBrowserUptimeHours(HashSet<int> pids)
+        {
+            DateTime earliest = DateTime.MaxValue;
+            foreach (int pid in pids)
+            {
+                DateTime started = NativeMethods.ProcessStartUtc(pid);
+                if (started != DateTime.MinValue && started < earliest) earliest = started;
+            }
+            if (earliest == DateTime.MaxValue) return -1;
+            return (DateTime.UtcNow - earliest).TotalHours;
+        }
+
+        private void StartRestart(List<IntPtr> wins, int mainPid, bool rehideAfter)
+        {
+            if (_restarting || _launchingAside || _cleanedUp || mainPid == 0) return;
+            string exe = RelaunchExe(mainPid);
+            if (string.IsNullOrEmpty(exe)) return;
+            // Keep the main process open (SYNCHRONIZE) so the wait is about this process even if its id is reused.
+            IntPtr mainHandle = NativeMethods.OpenProcess(NativeMethods.SYNCHRONIZE | NativeMethods.PROCESS_QUERY_LIMITED_INFORMATION, false, mainPid);
+            if (mainHandle == IntPtr.Zero) return;
+            long mainStartTicks = NativeMethods.ProcessStartUtc(mainPid).Ticks;
+            var targets = new List<IntPtr>(wins);
+            foreach (var h in _hidden.Keys)
+            {
+                if (!targets.Contains(h)) targets.Add(h);
+            }
+            // The restart thread counts the main process's windows, visible or hidden: a window this helper hides
+            // during the wait, or one the user opens, still counts as open.
+            var mainOnly = new HashSet<int>();
+            mainOnly.Add(mainPid);
+            _restarting = true;
+            _restartCritical = true;
+            _showAfterRestart = false;
+            _rehideCounts.Clear();
+            // Start the waiting thread first: if that fails, nothing has been closed yet.
+            try
+            {
+                var worker = new Thread(() => RunRestart(exe, mainPid, mainStartTicks, mainHandle, mainOnly, rehideAfter));
+                worker.IsBackground = true;
+                worker.Name = "BrowserRestart";
+                worker.Start();
+            }
+            catch
+            {
+                NativeMethods.CloseHandle(mainHandle);
+                _restartCritical = false;
+                _restarting = false;
+                return;
+            }
+            // Ask the window to close the normal way (a posted WM_CLOSE does not pass through the close-button mouse
+            // hook), so the browser saves its session and exits on its own.
+            foreach (var h in targets)
+            {
+                if (NativeMethods.IsWindow(h)) NativeMethods.PostMessage(h, NativeMethods.WM_CLOSE, IntPtr.Zero, IntPtr.Zero);
+            }
+        }
+
+        // Runs on its own background thread: waits for the browser to exit, then starts it again. Never kills a
+        // process. While _restartCritical is set the browser may be closed and not open again yet, so RequestExit
+        // waits for it to clear.
+        private void RunRestart(string exe, int mainPid, long mainStartTicks, IntPtr mainHandle, HashSet<int> mainOnly,
+            bool rehideAfter)
+        {
+            string result = "unknown";
+            try
+            {
+                bool exited = WaitExit(mainHandle, CLOSE_WAIT_MS);
+                if (!exited && CountBrowserWindows(mainOnly) > 0)
+                {
+                    // A window is still open, so a page asks something (for example "Leave site?"). The browser is
+                    // open, so this part is not critical: show the window, tell the user, and wait for the answer.
+                    AddSignal(SIGNAL_SHOW_FOR_PROMPT | SIGNAL_BALLOON_PROMPT);
+                    _restartCritical = false;
+                    int answer = WaitForPromptAnswer(mainHandle, mainOnly);
+                    if (answer == PROMPT_EXITED)
+                    {
+                        if (SessionIsEnding()) { result = "session-ending"; return; }
+                        result = Relaunch(exe, false) ? "restarted-after-prompt" : "relaunch-failed";
+                        SetBackoff(result == "restarted-after-prompt" ? COOLDOWN_AFTER_RESTART : BACKOFF_FAILED);
+                        return;
+                    }
+                    if (answer == PROMPT_STILL_OPEN)
+                    {
+                        // No answer in time, or the user chose to stay: leave the browser as it is.
+                        result = "blocked";
+                        SetBackoff(BACKOFF_FAILED);
+                        return;
+                    }
+                    // PROMPT_WINDOWS_GONE: the windows closed but the process stays; handled below like any other.
+                }
+                else if (!exited)
+                {
+                    // No window is left but the process lives on: give a slow shutdown a little more time.
+                    exited = WaitExit(mainHandle, SLOW_EXIT_WAIT_MS);
+                }
+                if (SessionIsEnding())
+                {
+                    result = "session-ending";
+                    return;
+                }
+                if (exited)
+                {
+                    result = Relaunch(exe, rehideAfter && !_showAfterRestart) ? "restarted" : "relaunch-failed";
+                    SetBackoff(result == "restarted" ? COOLDOWN_AFTER_RESTART : BACKOFF_FAILED);
+                }
+                else
+                {
+                    // The browser keeps running without windows (for example a "keep running in the background"
+                    // setting): bring its window back. Its memory is not released, so this process (same id and start
+                    // time) is not restarted automatically again while it lives.
+                    Interlocked.Exchange(ref _noExitMainStartTicks, mainStartTicks);
+                    _noExitMainPid = mainPid;
+                    result = Relaunch(exe, false) ? "no-exit" : "relaunch-failed";
+                    AddSignal(SIGNAL_BALLOON_NO_EXIT);
+                    SetBackoff(BACKOFF_FAILED);
+                }
+            }
+            catch (Exception ex)
+            {
+                result = "error:" + ex.GetType().Name;
+                SetBackoff(BACKOFF_FAILED);
+                AddSignal(SIGNAL_BALLOON_FAILED);
+            }
+            finally
+            {
+                NativeMethods.CloseHandle(mainHandle);
+                _lastRestartResult = result;
+                _restartCritical = false;
+                _restarting = false;
+            }
+        }
+
+        private const int PROMPT_EXITED = 0;
+        private const int PROMPT_WINDOWS_GONE = 1;
+        private const int PROMPT_STILL_OPEN = 2;
+
+        // Waits up to PROMPT_WAIT_MS for the user's answer. When the windows go away (the user chose to leave, or
+        // closed the browser), the browser is closing: from then on an exit request waits for the relaunch again,
+        // and the browser gets SLOW_EXIT_WAIT_MS more to finish.
+        private int WaitForPromptAnswer(IntPtr mainHandle, HashSet<int> mainOnly)
+        {
+            var sw = Stopwatch.StartNew();
+            while (sw.ElapsedMilliseconds < PROMPT_WAIT_MS)
+            {
+                if (WaitExit(mainHandle, 1000)) return PROMPT_EXITED;
+                if (CountBrowserWindows(mainOnly) == 0)
+                {
+                    _restartCritical = true;
+                    return WaitExit(mainHandle, SLOW_EXIT_WAIT_MS) ? PROMPT_EXITED : PROMPT_WINDOWS_GONE;
+                }
+            }
+            return WaitExit(mainHandle, 0) ? PROMPT_EXITED : PROMPT_STILL_OPEN;
+        }
+
+        // True when Windows is signing out or shutting down. A query to end the session can still be cancelled, so
+        // after a query in the last minute this waits up to SESSION_END_CONFIRM_MS (timed on this thread) for
+        // Windows to confirm with SessionEnded; without that confirmation the session goes on.
+        private bool SessionIsEnding()
+        {
+            if (_sessionEnded) return true;
+            long asked = Interlocked.Read(ref _sessionEndingTicks);
+            if (asked == 0) return false;
+            long since = DateTime.UtcNow.Ticks - asked;
+            if (since < 0 || since > TimeSpan.FromMinutes(1).Ticks) return false;
+            var sw = Stopwatch.StartNew();
+            while (sw.ElapsedMilliseconds < SESSION_END_CONFIRM_MS)
+            {
+                if (_sessionEnded) return true;
+                Thread.Sleep(250);
+            }
+            return _sessionEnded;
+        }
+
+        private static bool WaitExit(IntPtr process, int ms)
+        {
+            return NativeMethods.WaitForSingleObject(process, (uint)ms) == NativeMethods.WAIT_OBJECT_0;
+        }
+
+        private void SetBackoff(TimeSpan span)
+        {
+            Interlocked.Exchange(ref _backoffUntilTicks, DateTime.UtcNow.Add(span).Ticks);
+        }
+
+        // Starts the browser again with its last session. Returns false, and asks for a balloon, when it cannot.
+        private bool Relaunch(string exe, bool rehideAfter)
+        {
+            if (string.IsNullOrEmpty(exe) || !File.Exists(exe))
+            {
+                AddSignal(SIGNAL_BALLOON_FAILED);
+                return false;
+            }
+            for (int attempt = 0; attempt < 2; attempt++)
+            {
+                try
+                {
+                    var psi = new ProcessStartInfo();
+                    psi.FileName = exe;
+                    psi.Arguments = "--restore-last-session";
+                    psi.UseShellExecute = true;
+                    psi.WindowStyle = rehideAfter ? ProcessWindowStyle.Minimized : ProcessWindowStyle.Normal;
+                    // Mark the relaunch before starting (settle time, rehide grace), so even a fast window is caught,
+                    // and undo the mark when starting fails, so the Start item works again at once.
+                    long startTicks = DateTime.UtcNow.Ticks;
+                    Interlocked.Exchange(ref _relaunchedTicks, startTicks);
+                    Interlocked.Exchange(ref _rehideUntilTicks, rehideAfter ? startTicks + TimeSpan.FromMilliseconds(REHIDE_GRACE_MS).Ticks : 0);
+                    using (Process.Start(psi)) { }
+                    return true;
+                }
+                catch
+                {
+                    Interlocked.Exchange(ref _relaunchedTicks, 0);
+                    Interlocked.Exchange(ref _rehideUntilTicks, 0);
+                    Thread.Sleep(2000);
+                }
+            }
+            AddSignal(SIGNAL_BALLOON_FAILED);
+            return false;
+        }
+
+        private static int CountBrowserWindows(HashSet<int> pids)
+        {
+            int n = 0;
+            NativeMethods.EnumWindows((h, l) =>
+            {
+                if (IsCandidateAsideWindow(h, pids)) n++;
+                return true;
+            }, IntPtr.Zero);
+            return n;
+        }
+
+        // For RELAUNCH_SETTLE_MS after a restart started the browser again, the new process may have no window yet: a
+        // request to show or start the browser then waits for that window instead of starting a second browser.
+        private bool RelaunchSettling()
+        {
+            long t = Interlocked.Read(ref _relaunchedTicks);
+            return t != 0 && DateTime.UtcNow.Ticks - t < TimeSpan.FromMilliseconds(RELAUNCH_SETTLE_MS).Ticks;
+        }
+
         private void LaunchAsideAsync()
         {
+            if (_restarting || RelaunchSettling())
+            {
+                // A restart is opening the browser again: show it when it comes back instead of starting another one.
+                _showAfterRestart = true;
+                Interlocked.Exchange(ref _rehideUntilTicks, 0);
+                return;
+            }
             if (_launchingAside) return;
             // Prefer an optional launcher script (for example one that starts Aside minimized
             // and returns focus); otherwise start Aside.exe directly.
@@ -1732,8 +2849,16 @@ namespace CloseToTrayHelper
             _taskbar.Dispose();
         }
 
+        // Windows asks whether the session may end; another program can still cancel that. Restoring windows and
+        // stopping happen in OnSessionEnded, once Windows confirms, so a cancelled sign-out leaves a working helper.
         private void OnSessionEnding(object sender, SessionEndingEventArgs e)
         {
+            Interlocked.Exchange(ref _sessionEndingTicks, DateTime.UtcNow.Ticks);
+        }
+
+        private void OnSessionEnded(object sender, SessionEndedEventArgs e)
+        {
+            _sessionEnded = true;
             RestoreAllOnExit();
         }
 
@@ -1749,6 +2874,13 @@ namespace CloseToTrayHelper
 
         public void RequestExit()
         {
+            if (_restartCritical)
+            {
+                // The browser is closed and not open again yet: finish that first; Reconcile exits afterwards.
+                _exitPending = true;
+                if (_miExit != null) _miExit.Enabled = false;
+                return;
+            }
             RestoreAllOnExit();
             ExitThread();
         }
@@ -2003,19 +3135,54 @@ if (-not ('CloseToTrayHelper.AsideTrayContext' -as [type])) {
     )
 }
 
+# -Restart is not an option of this script. Declaring it keeps PowerShell from reading it as a prefix of
+# -RestartBrowser, which would close and reopen the browser.
+if ($Restart) {
+    Out-Result ([ordered]@{ action = 'none'; error = 'unknown option -Restart'; browser = '-RestartBrowser'; helper = '-Stop, wait until the helper has exited (up to about 2 minutes while it finishes a browser restart), then start it again' }) '[close-to-tray] -Restart is not an option. To restart the browser use -RestartBrowser; to restart this helper use -Stop, wait until it has exited, then start it again.'
+    exit 2
+}
+
 # Handle one-shot IPC control flags (-Stop, -Show, -Hide, -Toggle).
-if ($Stop -or $Show -or $Hide -or $Toggle) {
+if ($Stop -or $Show -or $Hide -or $Toggle -or $RestartBrowser) {
     $cmd = [CloseToTrayHelper.TrayIpcCommand]::None
     $name = 'none'
     if ($Stop) { $cmd = [CloseToTrayHelper.TrayIpcCommand]::Stop; $name = 'stop' }
     elseif ($Show) { $cmd = [CloseToTrayHelper.TrayIpcCommand]::Show; $name = 'show' }
     elseif ($Hide) { $cmd = [CloseToTrayHelper.TrayIpcCommand]::Hide; $name = 'hide' }
     elseif ($Toggle) { $cmd = [CloseToTrayHelper.TrayIpcCommand]::Toggle; $name = 'toggle' }
+    elseif ($RestartBrowser) { $cmd = [CloseToTrayHelper.TrayIpcCommand]::RestartBrowser; $name = 'restart-browser' }
     $running = [CloseToTrayHelper.AsideIpc]::IsHelperRunning()
     $sent = [CloseToTrayHelper.AsideIpc]::SendCommand($cmd)
     $res = [ordered]@{ action = $name; running = $running; sent = $sent }
     Out-Result $res ("[close-to-tray] command=$name running=$running sent=$sent")
     exit 0
+}
+
+# Handle offline -PolicyTest: checks the restart decision table and how the saved preferences
+# are read. Opens no window and touches no other process.
+if ($PolicyTest) {
+    $diag = [CloseToTrayHelper.RestartPolicy]::RunTable()
+    $kv = @{}
+    foreach ($pair in ($diag -split ';')) {
+        $parts = $pair -split '=', 2
+        if ($parts.Count -eq 2) { $kv[$parts[0]] = $parts[1] }
+    }
+    $prefs = Read-TrayPrefs $PrefsPath
+    $ok = ($kv['ok'] -eq 'True')
+    $res = [ordered]@{
+        action = 'policy-test'
+        ok = $ok
+        cases = [int]$kv['cases']
+        failed = [string]$kv['failed']
+        prefs = [ordered]@{
+            auto_restart = [bool]$prefs.autoRestart
+            restart_at_gb = [double]$prefs.restartAtGB
+            restart_after_hours = [double]$prefs.restartAfterHours
+            restart_idle_minutes = [int]$prefs.restartIdleMinutes
+        }
+    }
+    Out-Result $res ("[close-to-tray] policy-test ok=$ok cases=$($kv['cases']) failed=$($kv['failed'])")
+    if ($ok) { exit 0 } else { exit 1 }
 }
 
 # Handle offline -SelfTest: compiles the controller, briefly shows three small top-most
@@ -2027,10 +3194,11 @@ if ($SelfTest) {
     if ($CloseToTray) { $prefs.closeToTray = $true; $prefsDirty = $true }
     if ($NoCloseToTray) { $prefs.closeToTray = $false; $prefsDirty = $true }
     if ($prefsDirty) {
-        Write-TrayPrefs -Path $PrefsPath -ModeVal $prefs.mode -AutoStartVal ([bool]$prefs.autoStartAside) -CloseToTrayVal ([bool]$prefs.closeToTray)
+        Write-TrayPrefs -Path $PrefsPath -Prefs $prefs
         $prefs = Read-TrayPrefs $PrefsPath
     }
     $csDiag = [CloseToTrayHelper.AsideTrayContext]::RunSelfTest($ResolvedAsideExe)
+    $policyOk = ([CloseToTrayHelper.RestartPolicy]::RunTable()).StartsWith('ok=True;')
     $kv = @{}
     foreach ($pair in ($csDiag -split ';')) {
         $parts = $pair -split '=', 2
@@ -2049,12 +3217,17 @@ if ($SelfTest) {
         $kv['multi_passed'] -eq 'True' -and
         $kv['disabled_passed'] -eq 'True'
     )
-    $ok = ([bool]($kv['ipc_msg'] -eq 'True') -and [int]$kv['tip_len'] -le 63 -and (Test-Path -LiteralPath $LauncherVbs -PathType Leaf) -and $closeOk)
+    $ok = ([bool]($kv['ipc_msg'] -eq 'True') -and [int]$kv['tip_len'] -le 63 -and (Test-Path -LiteralPath $LauncherVbs -PathType Leaf) -and $closeOk -and $policyOk)
     $res = [ordered]@{
         self_test_ok = $ok
         mode = $prefs.mode
         auto_start_aside = [bool]$prefs.autoStartAside
         close_to_tray = [bool]$prefs.closeToTray
+        auto_restart = [bool]$prefs.autoRestart
+        restart_at_gb = [double]$prefs.restartAtGB
+        restart_after_hours = [double]$prefs.restartAfterHours
+        restart_idle_minutes = [int]$prefs.restartIdleMinutes
+        restart_policy_ok = $policyOk
         aside_exe = $ResolvedAsideExe
         aside_exe_found = ([bool]$ResolvedAsideExe -and (Test-Path -LiteralPath $ResolvedAsideExe -PathType Leaf))
         aside_up_found = (Test-Path -LiteralPath $AsideUpScript -PathType Leaf)
@@ -2103,7 +3276,7 @@ try {
     if ($CloseToTray) { $prefs.closeToTray = $true; $prefsDirty = $true }
     if ($NoCloseToTray) { $prefs.closeToTray = $false; $prefsDirty = $true }
     if ($prefsDirty) {
-        Write-TrayPrefs -Path $PrefsPath -ModeVal $prefs.mode -AutoStartVal ([bool]$prefs.autoStartAside) -CloseToTrayVal ([bool]$prefs.closeToTray)
+        Write-TrayPrefs -Path $PrefsPath -Prefs $prefs
     }
     $hideMode = if ($prefs.mode -eq 'HideWindow') { [CloseToTrayHelper.HideMode]::HideWindow } else { [CloseToTrayHelper.HideMode]::DeleteTab }
 
@@ -2116,6 +3289,10 @@ try {
         $hideMode,
         [bool]$prefs.autoStartAside,
         [bool]$prefs.closeToTray,
+        [bool]$prefs.autoRestart,
+        [double]$prefs.restartAtGB,
+        [double]$prefs.restartAfterHours,
+        [int]$prefs.restartIdleMinutes,
         [bool]$StartAside
     )
     [System.Windows.Forms.Application]::Run($ctx)
